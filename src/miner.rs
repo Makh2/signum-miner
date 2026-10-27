@@ -138,6 +138,17 @@ pub struct CpuBuffer {
 
 impl CpuBuffer {
     pub fn new(buffer_size: usize) -> Self {
+        // Zero-length buffers are only used as `gpu_signal` carriers: no worker ever
+        // reads from or writes to them. Allocating one through the page-aligned path
+        // below would hand a page-aligned block to a `Vec<u8>`, which frees with
+        // align == 1 - a layout mismatch that corrupts the Windows heap as soon as
+        // such a buffer is dropped (which for signal dummies happens every round).
+        if buffer_size == 0 {
+            return CpuBuffer {
+                data: Arc::new(Mutex::new(Vec::new())),
+            };
+        }
+
         let alignment = page_size::get();
         let layout = Layout::from_size_align(buffer_size, alignment)
             .expect("Invalid layout");
@@ -152,6 +163,11 @@ impl CpuBuffer {
         // SAFETY:
         // - raw_ptr must be non-null and valid for `buffer_size` bytes
         // - memory must be initialized (we used alloc_zeroed)
+        //
+        // NOTE: the resulting `Vec` does not remember `alignment`, so dropping it
+        // calls `dealloc` with align == 1 while the block was allocated with
+        // `alignment`. Keep these buffers alive for the whole process (the miner
+        // does) instead of dropping them mid-run.
         let data = unsafe {
             Vec::from_raw_parts(raw_ptr, buffer_size, buffer_size)
         };
