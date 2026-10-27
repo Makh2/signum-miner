@@ -1,6 +1,8 @@
 use crate::miner::Buffer;
 #[cfg(feature = "opencl")]
 use crate::miner::CpuBuffer;
+#[cfg(feature = "opencl")]
+use crate::plot::SCOOP_SIZE;
 use crate::plot::{Meta, Plot};
 use crate::utils::new_thread_pool;
 use crossbeam_channel;
@@ -97,7 +99,8 @@ impl Reader {
         for i in 0..self.tx_read_replies_gpu.as_ref().unwrap().len() {
             self.tx_read_replies_gpu.as_ref().unwrap()[i]
                 .send(ReadReply {
-                    buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
+                    buffer: Box::new(CpuBuffer::new(SCOOP_SIZE as usize))
+                        as Box<dyn Buffer + Send>,
                     info: BufferInfo {
                         len: 1,
                         height,
@@ -302,7 +305,8 @@ impl Reader {
                         for i in 0..tx_read_replies_gpu.as_ref().unwrap().len() {
                             tx_read_replies_gpu.as_ref().unwrap()[i]
                                 .send(ReadReply {
-                                    buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
+                                    buffer: Box::new(CpuBuffer::new(SCOOP_SIZE as usize))
+                        as Box<dyn Buffer + Send>,
                                     info: BufferInfo {
                                         len: 1,
                                         height,

@@ -5,8 +5,6 @@ use crate::future::interval::Interval;
 #[cfg(feature = "opencl")]
 use crate::gpu_worker::create_gpu_worker_task;
 #[cfg(feature = "opencl")]
-use crate::gpu_worker_async::create_gpu_worker_task_async;
-#[cfg(feature = "opencl")]
 use crate::ocl::GpuBuffer;
 #[cfg(feature = "opencl")]
 use crate::ocl::GpuContext;
@@ -405,30 +403,25 @@ impl Miner {
         });
 
         #[cfg(feature = "opencl")]
+        if cfg.gpu_async {
+            warn!(
+                "gpu_async is not supported by this build (the async GPU worker was removed \
+                 with the futures 0.1 -> 0.3 migration); using the synchronous GPU worker \
+                 instead. Prefer gpu_mem_mapping = true."
+            );
+        }
+
+        #[cfg(feature = "opencl")]
         for i in 0..gpu_threads {
-            if cfg.gpu_async {
-                thread::spawn({
-                    create_gpu_worker_task_async(
-                        cfg.benchmark_io(),
-                        rx_read_replies_gpu[i].clone(),
-                        tx_empty_buffers.clone(),
-                        tx_nonce_data.clone(),
-                        gpu_contexts[i].clone(),
-                        drive_id_to_plots.len(),
-                    )
-                });
-            } else {
-                #[cfg(feature = "opencl")]
-                thread::spawn({
-                    create_gpu_worker_task(
-                        cfg.benchmark_io(),
-                        rx_read_replies_gpu[i].clone(),
-                        tx_empty_buffers.clone(),
-                        tx_nonce_data.clone(),
-                        gpu_contexts[i].clone(),
-                    )
-                });
-            }
+            thread::spawn({
+                create_gpu_worker_task(
+                    cfg.benchmark_io(),
+                    rx_read_replies_gpu[i].clone(),
+                    tx_empty_buffers.clone(),
+                    tx_nonce_data.clone(),
+                    gpu_contexts[i].clone(),
+                )
+            });
         }
 
         #[cfg(feature = "opencl")]
