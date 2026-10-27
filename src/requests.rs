@@ -232,10 +232,10 @@ fn log_learned_limit(learned: Learned, height: u64, deadline: u64, account_id: u
              (pool refused {}s), account={}",
             limit, height, deadline, account_id,
         ),
-        Learned::ZeroDeadline => info!(
-            "learned submission limit: pool refuses the zero-second deadline, no longer offering \
-             it for height={} (pool refused {}s), account={}",
-            height, deadline, account_id,
+        Learned::Floor(limit) => info!(
+            "learned submission limit: no longer submitting deadlines at or below {}s for \
+             height={} (pool refused {}s), account={}",
+            limit, height, deadline, account_id,
         ),
     }
 }

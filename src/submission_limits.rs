@@ -9,16 +9,16 @@
 //!
 //! Two things are learned, both only from an actual refusal:
 //!
-//! * A refusal at a plausible deadline lowers the ceiling for the chain the
-//!   share belonged to: if the pool refused a share, its limit is below it.
-//!   Refusals of implausibly good shares are ignored - pools refuse those for
-//!   other reasons, and learning from them would silence submissions for good.
+//! * A refusal at a normal deadline lowers the ceiling for the chain the share
+//!   belonged to: if the pool refused a share, its limit is below it.
 //!
-//! * A refusal of the zero-second deadline - the best share that can exist -
-//!   is not a ceiling at all: a pool doing that refuses the very best share
-//!   for its own reasons (foxy-pool does), so the zero deadline is simply no
-//!   longer offered to that chain. Only the exact zero is dropped; a share
-//!   that rounds to one second is untouched.
+//! * A refusal of an extreme deadline - one of the best shares that can exist,
+//!   a fraction of a second - is not a ceiling at all: a pool doing that
+//!   refuses the very best shares for its own reasons (foxy-pool does, on the
+//!   testnet), and lowering a ceiling to there would silence submissions for
+//!   good. The extreme itself is remembered instead, and no longer offered.
+//!   Only the exact values refused are dropped; a share a second better is
+//!   untouched.
 //!
 //! Whatever is learned only ever tightens, so a restart is the way to start
 //! over (for example after a pool raises its limit).
@@ -26,9 +26,10 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// A refusal at or below this many seconds is not taken as evidence that the
-/// deadline was too high. Zero is handled separately - see `Learned`.
-const MIN_LEARNABLE_DEADLINE: u64 = 2;
+/// A refusal at or above this many seconds is taken as evidence about the
+/// ceiling. Refusals below it say nothing about the ceiling and are treated as
+/// extreme values instead - see `Limit::floor`.
+const MIN_CEILING_DEADLINE: u64 = 2;
 
 /// How much of the height is dropped when bucketing chains. Mining two chains
 /// through one proxy mixes their submissions, and their heights are far apart,
@@ -49,23 +50,23 @@ pub fn is_deadline_too_high(message: &str) -> bool {
 pub enum Learned {
     /// The pool refuses deadlines above this many seconds.
     Ceiling(u64),
-    /// The pool refuses the zero-second deadline itself.
-    ZeroDeadline,
+    /// The pool refuses deadlines at or below this many seconds.
+    Floor(u64),
 }
 
 #[derive(Clone, Copy)]
 struct Limit {
     /// Largest deadline worth submitting, `NO_LIMIT` while unknown.
     max_deadline: u64,
-    /// The pool has refused a zero-second deadline on this chain.
-    zero_deadline_refused: bool,
+    /// Largest refused deadline below the ceiling threshold, if any.
+    floor: Option<u64>,
 }
 
 impl Default for Limit {
     fn default() -> Self {
         Limit {
             max_deadline: NO_LIMIT,
-            zero_deadline_refused: false,
+            floor: None,
         }
     }
 }
@@ -88,13 +89,10 @@ impl SubmissionLimits {
     pub fn allows(&self, height: u64, deadline: u64) -> bool {
         match self.limits.lock().unwrap().get(&Self::bucket(height)) {
             None => true,
-            Some(limit) => {
-                if deadline == 0 {
-                    !limit.zero_deadline_refused
-                } else {
-                    deadline < limit.max_deadline
-                }
-            }
+            Some(limit) => match limit.floor {
+                Some(floor) if deadline <= floor => false,
+                _ => deadline < limit.max_deadline,
+            },
         }
     }
 
@@ -114,15 +112,13 @@ impl SubmissionLimits {
         let mut limits = self.limits.lock().unwrap();
         let limit = limits.entry(Self::bucket(height)).or_default();
 
-        if deadline == 0 {
-            if limit.zero_deadline_refused {
-                return None;
+        if deadline < MIN_CEILING_DEADLINE {
+            // Too good to say anything about the ceiling; remember the extreme
+            // itself. Only a tighter one is news.
+            if limit.floor.map_or(true, |floor| deadline > floor) {
+                limit.floor = Some(deadline);
+                return Some(Learned::Floor(deadline));
             }
-            limit.zero_deadline_refused = true;
-            return Some(Learned::ZeroDeadline);
-        }
-
-        if deadline < MIN_LEARNABLE_DEADLINE {
             return None;
         }
 
@@ -140,7 +136,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn learns_the_limit_from_refusals() {
+    fn learns_the_ceiling_from_refusals() {
         let limits = SubmissionLimits::new();
         let height = 998_828;
 
@@ -164,22 +160,40 @@ mod tests {
     }
 
     #[test]
-    fn stops_offering_the_zero_deadline_once_refused() {
+    fn remembers_extreme_refusals() {
         let limits = SubmissionLimits::new();
         let height = 998_828;
 
         // The best possible share is worth a try while the pool hasn't refused it.
         assert!(limits.allows(height, 0));
-
-        assert_eq!(limits.on_rejected(height, 0), Some(Learned::ZeroDeadline));
-        assert!(!limits.allows(height, 0));
-
-        // Only the exact zero is dropped - one second onwards is a normal share.
         assert!(limits.allows(height, 1));
+
+        // A refused zero-second share is remembered, without turning into a
+        // ceiling: one second onwards is a normal share.
+        assert_eq!(limits.on_rejected(height, 0), Some(Learned::Floor(0)));
+        assert!(!limits.allows(height, 0));
+        assert!(limits.allows(height, 1));
+        assert!(limits.allows(height, 2));
         assert_eq!(limits.max_deadline(height), NO_LIMIT);
 
-        // A second zero-refusal teaches nothing new.
+        // A refused one-second share tightens it, and repeating teaches nothing.
+        assert_eq!(limits.on_rejected(height, 1), Some(Learned::Floor(1)));
+        assert!(!limits.allows(height, 1));
+        assert!(limits.allows(height, 2));
+        assert_eq!(limits.on_rejected(height, 1), None);
         assert_eq!(limits.on_rejected(height, 0), None);
+    }
+
+    #[test]
+    fn the_floor_only_tightens() {
+        let limits = SubmissionLimits::new();
+        let height = 998_828;
+
+        assert_eq!(limits.on_rejected(height, 1), Some(Learned::Floor(1)));
+        // A later refusal of something better adds nothing.
+        assert_eq!(limits.on_rejected(height, 0), None);
+        assert!(!limits.allows(height, 1));
+        assert!(limits.allows(height, 2));
     }
 
     #[test]
@@ -189,24 +203,13 @@ mod tests {
         let testnet = 998_828;
 
         assert_eq!(limits.on_rejected(testnet, 79), Some(Learned::Ceiling(78)));
-        assert_eq!(limits.on_rejected(testnet, 0), Some(Learned::ZeroDeadline));
+        assert_eq!(limits.on_rejected(testnet, 0), Some(Learned::Floor(0)));
 
         // What was learned on the testnet must not filter mainnet shares.
         assert_eq!(limits.max_deadline(mainnet), NO_LIMIT);
         assert!(limits.allows(mainnet, 0));
         assert_eq!(limits.max_deadline(testnet), 78);
         assert!(!limits.allows(testnet, 0));
-    }
-
-    #[test]
-    fn ignores_implausible_refusals() {
-        let limits = SubmissionLimits::new();
-        let height = 998_828;
-
-        // A one-second refusal is not a "deadline too high" signal.
-        assert_eq!(limits.on_rejected(height, 1), None);
-        assert_eq!(limits.max_deadline(height), NO_LIMIT);
-        assert!(limits.allows(height, 1));
     }
 
     #[test]
