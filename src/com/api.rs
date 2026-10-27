@@ -53,6 +53,18 @@ struct PoolErrorWrapper {
     error: PoolError,
 }
 
+/// Some pools answer with a bare `{"result": "..."}` instead of an error
+/// object, e.g. `{"result": "Deadline exceeds maximum allowed deadline"}` for
+/// a share whose deadline was too high.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PoolResultWrapper {
+    result: String,
+}
+
+/// `PoolError::code` used for a bare `{"result": "..."}` answer.
+pub const POOL_RESULT_CODE: i32 = -1;
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolError {
@@ -108,13 +120,24 @@ pub fn parse_json_result<T: DeserializeOwned>(body: &Bytes) -> Result<T, PoolErr
         Ok(x) => Ok(x),
         _ => match serde_json::from_slice::<PoolErrorWrapper>(body) {
             Ok(x) => Err(x.error),
-            _ => {
-                let v = body.to_vec();
-                Err(PoolError {
-                    code: 0,
-                    message: String::from_utf8_lossy(&v).to_string(),
-                })
-            }
+            // A pool can also answer with neither the expected payload nor an
+            // `error` object, but with a bare `{"result": "..."}` - that is
+            // how a refused share is reported. Without this branch such an
+            // answer would surface as an opaque `code: 0` with the whole JSON
+            // as the message.
+            Err(_) => match serde_json::from_slice::<PoolResultWrapper>(body) {
+                Ok(x) => Err(PoolError {
+                    code: POOL_RESULT_CODE,
+                    message: x.result,
+                }),
+                Err(_) => {
+                    let v = body.to_vec();
+                    Err(PoolError {
+                        code: 0,
+                        message: String::from_utf8_lossy(&v).to_string(),
+                    })
+                }
+            },
         },
     }
 }

@@ -1,8 +1,10 @@
 use crate::com::api::{FetchError, MiningInfoResponse};
 use crate::com::client::{Client, ProxyDetails, SubmissionParameters};
 use crate::future::prio_retry::PrioRetry;
+use crate::submission_limits::{is_deadline_too_high, SubmissionLimits};
 use futures_util::stream::{StreamExt};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -23,6 +25,7 @@ impl RequestHandler {
         send_proxy_details: bool,
         additional_headers: HashMap<String, String>,
         handle: tokio::runtime::Handle,
+        limits: Arc<SubmissionLimits>,
     ) -> RequestHandler {
         let proxy_details = if send_proxy_details {
             ProxyDetails::Enabled
@@ -45,6 +48,7 @@ impl RequestHandler {
             rx_submit_nonce_data,
             tx_submit_data.clone(),
             handle,
+            limits,
         );
 
         RequestHandler {
@@ -58,6 +62,7 @@ impl RequestHandler {
         rx: mpsc::UnboundedReceiver<SubmissionParameters>,
         tx_submit_data: mpsc::UnboundedSender<SubmissionParameters>,
         handle: tokio::runtime::Handle,
+        limits: Arc<SubmissionLimits>,
     ) {
         handle.spawn(async move {
             let wrapped_rx = UnboundedReceiverStream::new(rx);
@@ -97,6 +102,23 @@ impl RequestHandler {
                                 error!("can't send submission params");
                             }
                         } else {
+                            // The pool telling us the deadline was too high is
+                            // the only hint about where its limit is, so learn
+                            // from it instead of guessing a constant.
+                            if is_deadline_too_high(&e.message) {
+                                if let Some(limit) = limits
+                                    .on_rejected(submission_params.height, submission_params.deadline)
+                                {
+                                    info!(
+                                        "learned submission limit: no longer submitting deadlines \
+                                         above {}s for height={} (pool refused {}s), account={}",
+                                        limit,
+                                        submission_params.height,
+                                        submission_params.deadline,
+                                        submission_params.account_id,
+                                    );
+                                }
+                            }
                             log_submission_not_accepted(
                                 submission_params.height,
                                 submission_params.account_id,
@@ -160,10 +182,23 @@ fn log_deadline_mismatch(
     deadline: u64,
     deadline_pool: u64,
 ) {
-    error!(
-        "submit: deadlines mismatch, height={}, account={}, nonce={}, \
-         deadline_miner={}, deadline_pool={}",
-        height, account_id, nonce, deadline, deadline_pool
+    // The pool echoes the deadline in its own scale (the raw value, or one
+    // computed from its own base target), so the two numbers almost never
+    // match. That is a measurement, not an error: the ratio tells how far the
+    // pool's scale is from ours.
+    debug!(
+        "submit: pool echoed a different deadline scale, height={}, account={}, nonce={}, \
+         deadline_miner={}, deadline_pool={}, ratio={:.3}",
+        height,
+        account_id,
+        nonce,
+        deadline,
+        deadline_pool,
+        if deadline > 0 {
+            deadline_pool as f64 / deadline as f64
+        } else {
+            0.0
+        },
     );
 }
 
@@ -231,6 +266,7 @@ mod tests {
         true,
         HashMap::new(),
         handle,
+        Arc::new(SubmissionLimits::new()),
     );
 
     request_handler.submit_nonce(1337, 12, 111, 0, 7123, 1193, [0; 32]);

@@ -12,6 +12,7 @@ use crate::plot::{Plot, SCOOP_SIZE};
 use crate::poc_hashing;
 use crate::reader::Reader;
 use crate::requests::RequestHandler;
+use crate::submission_limits::SubmissionLimits;
 use crate::utils::{get_device_id, new_thread_pool};
 use crossbeam_channel;
 use filetime::FileTime;
@@ -48,6 +49,7 @@ pub struct Miner {
     executor: Handle,
     wakeup_after: i64,
     submit_only_best: bool,
+    submission_limits: Arc<SubmissionLimits>,
 }
 
 pub struct State {
@@ -537,6 +539,10 @@ impl Miner {
         #[cfg(not(feature = "opencl"))]
         let tx_read_replies_gpu = None;
 
+        // Shared with the submission loop, which learns the pools' deadline
+        // limits from their refusals while we read them here before sending.
+        let submission_limits = Arc::new(SubmissionLimits::new());
+
         Miner {
             reader_task_count: drive_id_to_plots.len(),
             reader: Reader::new(
@@ -563,6 +569,7 @@ impl Miner {
                 cfg.send_proxy_details,
                 cfg.additional_headers,
                 executor.clone(),
+                submission_limits.clone(),
             ),
             state: Arc::new(Mutex::new(State::new())),
             // floor at 1s to protect servers
@@ -570,6 +577,7 @@ impl Miner {
             executor,
             wakeup_after: cfg.hdd_wakeup_after * 1000, // ms -> s
             submit_only_best : cfg.submit_only_best,
+            submission_limits,
         }
     }
 
@@ -663,6 +671,7 @@ impl Miner {
         let state = self.state.clone();
         let reader_task_count = self.reader_task_count;
         let inner_submit_only_best = self.submit_only_best;
+        let submission_limits = self.submission_limits.clone();
         self.executor.clone().spawn(
             ReceiverStream::new(self.rx_nonce_data)
                 .for_each(move |nonce_data| {
@@ -682,6 +691,10 @@ impl Miner {
                                         .get(&nonce_data.account_id)
                                         .unwrap_or(&target_deadline)),
                                 )
+                            // Pools refuse deadlines above a limit of theirs and
+                            // never advertise it, so we learn it from their
+                            // refusals and stop offering what they throw away.
+                            && deadline < submission_limits.max_deadline(nonce_data.height)
                         {
                             state
                                 .account_id_to_best_deadline
@@ -721,15 +734,20 @@ impl Miner {
                                 // Submit now our best one, if configured that way
                                 if best_nonce_data.height == state.height {
                                     let deadline = best_nonce_data.deadline / best_nonce_data.base_target;
-                                    request_handler.submit_nonce(
-                                        best_nonce_data.account_id,
-                                        best_nonce_data.nonce,
-                                        best_nonce_data.height,
-                                        best_nonce_data.block,
-                                        best_nonce_data.deadline,
-                                        deadline,
-                                        state.generation_signature_bytes,
-                                    );
+                                    // The limit may have been learned while the
+                                    // round was running, so check it again
+                                    // before spending a request on the share.
+                                    if deadline < submission_limits.max_deadline(best_nonce_data.height) {
+                                        request_handler.submit_nonce(
+                                            best_nonce_data.account_id,
+                                            best_nonce_data.nonce,
+                                            best_nonce_data.height,
+                                            best_nonce_data.block,
+                                            best_nonce_data.deadline,
+                                            deadline,
+                                            state.generation_signature_bytes,
+                                        );
+                                    }
                                 }
 
                                 state.sw.restart();

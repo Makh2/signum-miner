@@ -19,6 +19,7 @@ mod poc_hashing;
 mod reader;
 mod requests;
 mod shabal256;
+mod submission_limits;
 mod utils;
 
 #[cfg(feature = "opencl")]
