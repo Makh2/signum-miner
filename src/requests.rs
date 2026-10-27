@@ -1,7 +1,7 @@
 use crate::com::api::{FetchError, MiningInfoResponse};
 use crate::com::client::{Client, ProxyDetails, SubmissionParameters};
 use crate::future::prio_retry::PrioRetry;
-use crate::submission_limits::{is_deadline_too_high, SubmissionLimits};
+use crate::submission_limits::{is_deadline_too_high, Learned, SubmissionLimits};
 use futures_util::stream::{StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,13 +106,11 @@ impl RequestHandler {
                             // the only hint about where its limit is, so learn
                             // from it instead of guessing a constant.
                             if is_deadline_too_high(&e.message) {
-                                if let Some(limit) = limits
+                                if let Some(learned) = limits
                                     .on_rejected(submission_params.height, submission_params.deadline)
                                 {
-                                    info!(
-                                        "learned submission limit: no longer submitting deadlines \
-                                         above {}s for height={} (pool refused {}s), account={}",
-                                        limit,
+                                    log_learned_limit(
+                                        learned,
                                         submission_params.height,
                                         submission_params.deadline,
                                         submission_params.account_id,
@@ -225,6 +223,21 @@ fn log_submission_not_accepted(
          deadline={}\n\tcode: {}\n\tmessage: {}",
         height, account_id, nonce, deadline, err_code, msg,
     );
+}
+
+fn log_learned_limit(learned: Learned, height: u64, deadline: u64, account_id: u64) {
+    match learned {
+        Learned::Ceiling(limit) => info!(
+            "learned submission limit: no longer submitting deadlines above {}s for height={} \
+             (pool refused {}s), account={}",
+            limit, height, deadline, account_id,
+        ),
+        Learned::ZeroDeadline => info!(
+            "learned submission limit: pool refuses the zero-second deadline, no longer offering \
+             it for height={} (pool refused {}s), account={}",
+            height, deadline, account_id,
+        ),
+    }
 }
 
 fn log_submission_accepted(account_id: u64, nonce: u64, deadline: u64) {

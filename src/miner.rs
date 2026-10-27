@@ -691,10 +691,11 @@ impl Miner {
                                         .get(&nonce_data.account_id)
                                         .unwrap_or(&target_deadline)),
                                 )
-                            // Pools refuse deadlines above a limit of theirs and
-                            // never advertise it, so we learn it from their
+                            // Pools refuse deadlines above a limit of theirs -
+                            // and the zero-second deadline itself - and never
+                            // advertise either, so we learn both from their
                             // refusals and stop offering what they throw away.
-                            && deadline < submission_limits.max_deadline(nonce_data.height)
+                            && submission_limits.allows(nonce_data.height, deadline)
                         {
                             state
                                 .account_id_to_best_deadline
@@ -734,10 +735,11 @@ impl Miner {
                                 // Submit now our best one, if configured that way
                                 if best_nonce_data.height == state.height {
                                     let deadline = best_nonce_data.deadline / best_nonce_data.base_target;
-                                    // The limit may have been learned while the
-                                    // round was running, so check it again
-                                    // before spending a request on the share.
-                                    if deadline < submission_limits.max_deadline(best_nonce_data.height) {
+                                    // What the pool accepts may have been
+                                    // learned while the round was running, so
+                                    // check it again before spending a request
+                                    // on the share.
+                                    if submission_limits.allows(best_nonce_data.height, deadline) {
                                         request_handler.submit_nonce(
                                             best_nonce_data.account_id,
                                             best_nonce_data.nonce,
