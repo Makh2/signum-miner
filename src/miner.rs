@@ -20,17 +20,19 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 #[cfg(feature = "opencl")]
 use ocl_core::Mem;
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::fs::read_dir;
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::process;
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::u64;
 use stopwatch::Stopwatch;
 use tokio::runtime::Handle;
-use std::alloc::{alloc_zeroed, Layout};
 use page_size;
 
 
@@ -121,68 +123,158 @@ pub struct NonceData {
     pub account_id: u64,
 }
 
+/// Backing store for the plot data a [`Buffer`] hands out.
+///
+/// The miner reads scoop data into memory that has to be aligned to the page
+/// size (the SIMD kernels read whole pages, and the OpenCL host mappings are
+/// page aligned anyway), while the GPU buffers are only *views* onto memory
+/// owned by the OpenCL driver. A `Vec<u8>` can express neither property: it
+/// always releases its block with `align == 1`, and it always assumes
+/// ownership of it.
+///
+/// `AlignedBuffer` keeps the layout it allocated with, so dropping it frees the
+/// very same block it allocated - and it can also borrow foreign memory it must
+/// not free at all.
+pub struct AlignedBuffer {
+    ptr: NonNull<u8>,
+    len: usize,
+    /// `Some` only for memory that was allocated by [`AlignedBuffer::zeroed`]
+    /// and therefore has to be released by us.
+    layout: Option<Layout>,
+}
+
+// The pointer either belongs to us (`layout: Some`, page-aligned, exclusively
+// owned) or to the OpenCL driver, which the miner only ever touches under the
+// buffer's `Mutex`.
+unsafe impl Send for AlignedBuffer {}
+unsafe impl Sync for AlignedBuffer {}
+
+impl AlignedBuffer {
+    /// A buffer that holds no memory and frees nothing.
+    pub fn empty() -> Self {
+        Self {
+            ptr: NonNull::dangling(),
+            len: 0,
+            layout: None,
+        }
+    }
+
+    /// `len` zeroed bytes, page aligned, released with the matching layout on
+    /// drop.
+    pub fn zeroed(len: usize) -> Self {
+        if len == 0 {
+            return Self::empty();
+        }
+
+        let layout =
+            Layout::from_size_align(len, page_size::get()).expect("Invalid layout");
+
+        // SAFETY: `layout` has a non-zero size (checked above).
+        let ptr = unsafe { alloc_zeroed(layout) };
+        let ptr = NonNull::new(ptr).expect("Aligned allocation failed");
+
+        Self {
+            ptr,
+            len,
+            layout: Some(layout),
+        }
+    }
+
+    /// Views foreign memory without taking ownership of it.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be valid for `len` readable and writable bytes for as long as
+    /// the view is used, and dropping the view must not invalidate them (the
+    /// memory is not freed by us).
+    pub unsafe fn from_raw(ptr: *mut u8, len: usize) -> Self {
+        match NonNull::new(ptr) {
+            Some(ptr) => Self {
+                ptr,
+                len,
+                layout: None,
+            },
+            None => Self::empty(),
+        }
+    }
+
+    /// Repoints a borrowed view at another address, e.g. because the driver
+    /// handed out a new host mapping.
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as [`AlignedBuffer::from_raw`].
+    pub unsafe fn set_raw(&mut self, ptr: *mut u8, len: usize) {
+        debug_assert!(self.layout.is_none(), "cannot repoint an owned buffer");
+        *self = Self::from_raw(ptr, len);
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Deref for AlignedBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `ptr` is valid for `len` bytes in every variant of the type.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl DerefMut for AlignedBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: see `deref`; the buffer is exclusively borrowed here.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        if let Some(layout) = self.layout {
+            // SAFETY: `ptr` was allocated by `alloc_zeroed` with exactly this
+            // `layout`, and `layout` is only ever `Some` for such buffers.
+            unsafe { dealloc(self.ptr.as_ptr(), layout) }
+        }
+    }
+}
+
 pub trait Buffer {
-    fn get_buffer(&mut self) -> Arc<Mutex<Vec<u8>>>;
-    fn get_buffer_for_writing(&mut self) -> Arc<Mutex<Vec<u8>>>;
+    fn get_buffer(&mut self) -> Arc<Mutex<AlignedBuffer>>;
+    fn get_buffer_for_writing(&mut self) -> Arc<Mutex<AlignedBuffer>>;
     #[cfg(feature = "opencl")]
     fn get_gpu_buffers(&self) -> Option<&GpuBuffer>;
     #[cfg(feature = "opencl")]
     fn get_gpu_data(&self) -> Option<Mem>;
-    fn unmap(&self);
+    fn unmap(&mut self);
     fn get_id(&self) -> usize;
 }
 
 pub struct CpuBuffer {
-    data: Arc<Mutex<Vec<u8>>>,
+    data: Arc<Mutex<AlignedBuffer>>,
 }
 
 impl CpuBuffer {
     pub fn new(buffer_size: usize) -> Self {
-        // Zero-length buffers are only used as `gpu_signal` carriers: no worker ever
-        // reads from or writes to them. Allocating one through the page-aligned path
-        // below would hand a page-aligned block to a `Vec<u8>`, which frees with
-        // align == 1 - a layout mismatch that corrupts the Windows heap as soon as
-        // such a buffer is dropped (which for signal dummies happens every round).
-        if buffer_size == 0 {
-            return CpuBuffer {
-                data: Arc::new(Mutex::new(Vec::new())),
-            };
-        }
-
-        let alignment = page_size::get();
-        let layout = Layout::from_size_align(buffer_size, alignment)
-            .expect("Invalid layout");
-
-        // SAFETY: caller must free this memory, and `Vec::from_raw_parts` must match
-        let raw_ptr = unsafe { alloc_zeroed(layout) };
-
-        if raw_ptr.is_null() {
-            panic!("Aligned allocation failed");
-        }
-
-        // SAFETY:
-        // - raw_ptr must be non-null and valid for `buffer_size` bytes
-        // - memory must be initialized (we used alloc_zeroed)
-        //
-        // NOTE: the resulting `Vec` does not remember `alignment`, so dropping it
-        // calls `dealloc` with align == 1 while the block was allocated with
-        // `alignment`. Keep these buffers alive for the whole process (the miner
-        // does) instead of dropping them mid-run.
-        let data = unsafe {
-            Vec::from_raw_parts(raw_ptr, buffer_size, buffer_size)
-        };
-
+        // Zero-length buffers are only used as `gpu_signal` carriers: no worker
+        // ever reads from or writes to them. `AlignedBuffer::zeroed` returns an
+        // empty, allocation-free buffer for them.
         CpuBuffer {
-            data: Arc::new(Mutex::new(data)),
+            data: Arc::new(Mutex::new(AlignedBuffer::zeroed(buffer_size))),
         }
     }
 }
 
 impl Buffer for CpuBuffer {
-    fn get_buffer(&mut self) -> Arc<Mutex<Vec<u8>>> {
+    fn get_buffer(&mut self) -> Arc<Mutex<AlignedBuffer>> {
         self.data.clone()
     }
-    fn get_buffer_for_writing(&mut self) -> Arc<Mutex<Vec<u8>>> {
+    fn get_buffer_for_writing(&mut self) -> Arc<Mutex<AlignedBuffer>> {
         self.data.clone()
     }
     #[cfg(feature = "opencl")]
@@ -193,7 +285,7 @@ impl Buffer for CpuBuffer {
     fn get_gpu_data(&self) -> Option<Mem> {
         None
     }
-    fn unmap(&self) {}
+    fn unmap(&mut self) {}
     fn get_id(&self) -> usize {
         0
     }
@@ -653,4 +745,41 @@ impl Miner {
         }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AlignedBuffer;
+
+    /// Regression guard for the heap corruption that killed the GPU worker:
+    /// `CpuBuffer` used to hand page-aligned memory to a `Vec<u8>`, which frees
+    /// its block with `align == 1`. Dropping such a buffer corrupted the heap
+    /// (STATUS_HEAP_CORRUPTION) instead of failing loudly, so the only way to
+    /// catch a regression is to allocate, use and drop real buffers.
+    #[test]
+    fn aligned_buffer_frees_with_its_own_layout() {
+        for _ in 0..100 {
+            let mut buffer = AlignedBuffer::zeroed(3 * 1024 * 1024);
+            assert_eq!(buffer.len(), 3 * 1024 * 1024);
+            assert_eq!(
+                buffer.as_ptr() as usize % page_size::get(),
+                0,
+                "buffer must stay page aligned"
+            );
+            buffer[0] = 1;
+            let last = buffer.len() - 1;
+            buffer[last] = 2;
+            drop(buffer);
+        }
+    }
+
+    /// The `gpu_signal` dummies are zero-sized and must not allocate.
+    #[test]
+    fn empty_buffer_allocates_nothing() {
+        let mut buffer = AlignedBuffer::zeroed(0);
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.iter().next().is_none());
+        drop(buffer);
+    }
 }

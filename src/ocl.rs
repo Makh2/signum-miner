@@ -4,11 +4,10 @@ use self::core::{
 use ocl_core as core;
 
 use crate::config::Cfg;
-use crate::miner::Buffer;
+use crate::miner::{AlignedBuffer, Buffer};
 use std::cmp::{max, min};
 use std::ffi::CString;
 use std::process;
-use std::slice::from_raw_parts_mut;
 use std::sync::{Arc, Mutex};
 
 static SRC: &'static str = include_str!("ocl/kernel.cl");
@@ -176,7 +175,10 @@ pub struct GpuContext {
 
 #[allow(dead_code)]
 pub struct GpuBuffer {
-    data: Arc<Mutex<Vec<u8>>>,
+    /// Host-side view of the data being read. Either the OpenCL host mapping
+    /// (`mapping`) or the pinned staging buffer (`!mapping`); the mapping is
+    /// owned by the driver, never by us.
+    data: Arc<Mutex<AlignedBuffer>>,
     buffer_ptr_host: Option<core::MemMap<u8>>,
     buffer_host: Option<core::Mem>,
     context: Arc<GpuContext>,
@@ -268,55 +270,55 @@ impl GpuContext {
 }
 
 impl GpuBuffer {
+    /// Number of bytes a single read chunk of this buffer can hold.
+    fn host_buffer_size(&self) -> usize {
+        (SCOOP_SIZE as usize) * self.context.gdim1[0]
+    }
+
     pub fn new(context: &Arc<GpuContext>, id: usize) -> Self {
         // create buffers
         // mapping = zero copy buffers, no mapping = pinned memory for fast DMA.
+        let size = (SCOOP_SIZE as usize) * context.gdim1[0];
         if context.mapping {
             let data_gpu = unsafe {
                 core::create_buffer::<_, u8>(
                     &context.context,
                     core::MEM_READ_ONLY | core::MEM_ALLOC_HOST_PTR,
-                    (SCOOP_SIZE as usize) * context.gdim1[0],
+                    size,
                     None,
                 )
                 .unwrap()
             };
 
-            let mut buffer_ptr_host = unsafe {
-                Some(
-                    core::enqueue_map_buffer::<u8, _, _, _>(
-                        &context.queue_transfer,
-                        &data_gpu,
-                        true,
-                        core::MAP_WRITE,
-                        0,
-                        (SCOOP_SIZE as usize) * context.gdim1[0],
-                        None::<Event>,
-                        None::<&mut Event>,
-                    )
-                    .unwrap(),
+            // Map and unmap once so the driver commits the host allocation.
+            // A host mapping is only valid while it is held, so the view stays
+            // empty until `get_buffer_for_writing` installs the mapping it
+            // actually hands out to the reader.
+            let map = unsafe {
+                core::enqueue_map_buffer::<u8, _, _, _>(
+                    &context.queue_transfer,
+                    &data_gpu,
+                    true,
+                    core::MAP_WRITE,
+                    0,
+                    size,
+                    None::<Event>,
+                    None::<&mut Event>,
                 )
+                .unwrap()
             };
-
-            let ptr = buffer_ptr_host.as_mut().unwrap().as_mut_ptr();
-            let boxed_slice = unsafe {
-                Box::<[u8]>::from_raw(from_raw_parts_mut(
-                    ptr,
-                    (SCOOP_SIZE as usize) * context.gdim1[0],
-                ))
-            };
-            let data = Arc::new(Mutex::new(boxed_slice.into_vec()));
 
             core::enqueue_unmap_mem_object(
                 &context.queue_transfer,
                 &data_gpu,
-                buffer_ptr_host.as_ref().unwrap(),
+                &map,
                 None::<Event>,
                 None::<&mut Event>,
             )
             .unwrap();
+
             GpuBuffer {
-                data,
+                data: Arc::new(Mutex::new(AlignedBuffer::empty())),
                 buffer_ptr_host: None,
                 buffer_host: None,
                 context: context.clone(),
@@ -328,7 +330,7 @@ impl GpuBuffer {
                 core::create_buffer::<_, u8>(
                     &context.context,
                     core::MEM_READ_ONLY | core::MEM_ALLOC_HOST_PTR,
-                    (SCOOP_SIZE as usize) * context.gdim1[0],
+                    size,
                     None,
                 )
                 .unwrap()
@@ -341,13 +343,14 @@ impl GpuBuffer {
                         true,
                         core::MAP_WRITE,
                         0,
-                        (SCOOP_SIZE as usize) * context.gdim1[0],
+                        size,
                         None::<Event>,
                         None::<&mut Event>,
                     )
                     .unwrap(),
                 )
             };
+
             let data_gpu = if context.nvidia {
                 buffer_host.clone()
             } else {
@@ -355,7 +358,7 @@ impl GpuBuffer {
                     core::create_buffer::<_, u8>(
                         &context.context,
                         core::MEM_READ_ONLY,
-                        (SCOOP_SIZE as usize) * context.gdim1[0],
+                        size,
                         None,
                     )
                     .unwrap()
@@ -367,14 +370,11 @@ impl GpuBuffer {
                 Some(buffer_host)
             };
 
+            // This mapping is held for the lifetime of the buffer, so the view
+            // can borrow it right away. The memory belongs to the driver and
+            // must not be released by us.
             let ptr = buffer_ptr_host.as_mut().unwrap().as_mut_ptr();
-            let boxed_slice = unsafe {
-                Box::<[u8]>::from_raw(from_raw_parts_mut(
-                    ptr,
-                    (SCOOP_SIZE as usize) * context.gdim1[0],
-                ))
-            };
-            let data = Arc::new(Mutex::new(boxed_slice.into_vec()));
+            let data = Arc::new(Mutex::new(unsafe { AlignedBuffer::from_raw(ptr, size) }));
 
             GpuBuffer {
                 data,
@@ -389,27 +389,34 @@ impl GpuBuffer {
 }
 
 impl Buffer for GpuBuffer {
-    fn get_buffer_for_writing(&mut self) -> Arc<Mutex<Vec<u8>>> {
+    fn get_buffer_for_writing(&mut self) -> Arc<Mutex<AlignedBuffer>> {
         if self.context.mapping {
+            let size = self.host_buffer_size();
+            let map = unsafe {
+                core::enqueue_map_buffer::<u8, _, _, _>(
+                    &self.context.queue_transfer,
+                    &self.data_gpu,
+                    true,
+                    core::MAP_WRITE,
+                    0,
+                    size,
+                    None::<Event>,
+                    None::<&mut Event>,
+                )
+                .unwrap()
+            };
+            let ptr = map.as_ptr() as *mut u8;
+
+            // Expose exactly the mapping we just obtained: it is the memory the
+            // reader has to write into, and any previous mapping is invalid.
             unsafe {
-                self.buffer_ptr_host = Some(
-                    core::enqueue_map_buffer::<u8, _, _, _>(
-                        &self.context.queue_transfer,
-                        &self.data_gpu,
-                        true,
-                        core::MAP_WRITE,
-                        0,
-                        (SCOOP_SIZE as usize) * self.context.gdim1[0],
-                        None::<Event>,
-                        None::<&mut Event>,
-                    )
-                    .unwrap(),
-                );
+                self.data.lock().unwrap().set_raw(ptr, size);
             }
+            self.buffer_ptr_host = Some(map);
         }
         self.data.clone()
     }
-    fn get_buffer(&mut self) -> Arc<Mutex<Vec<u8>>> {
+    fn get_buffer(&mut self) -> Arc<Mutex<AlignedBuffer>> {
         self.data.clone()
     }
     fn get_gpu_buffers(&self) -> Option<&GpuBuffer> {
@@ -418,12 +425,21 @@ impl Buffer for GpuBuffer {
     fn get_gpu_data(&self) -> Option<core::Mem> {
         Some(self.data_gpu.clone())
     }
-    fn unmap(&self) {
-        if self.context.mapping {
+    fn unmap(&mut self) {
+        if !self.context.mapping {
+            return;
+        }
+        // The host mapping goes away: nothing may read or write through the
+        // view until `get_buffer_for_writing` obtains a fresh mapping.
+        unsafe {
+            self.data.lock().unwrap().set_raw(std::ptr::null_mut(), 0);
+        }
+
+        if let Some(map) = self.buffer_ptr_host.take() {
             core::enqueue_unmap_mem_object(
                 &self.context.queue_transfer,
                 &self.data_gpu,
-                self.buffer_ptr_host.as_ref().unwrap(),
+                &map,
                 None::<Event>,
                 None::<&mut Event>,
             )
@@ -463,15 +479,19 @@ fn transfer_buffer_to_gpu(gpu_context: &Arc<GpuContext>, buffer: &GpuBuffer, blo
     let data = buffer.data.clone();
     let data2 = (*data).lock().unwrap();
     if gpu_context.mapping {
-        let temp2 = buffer.buffer_ptr_host.as_ref().unwrap();
-        core::enqueue_unmap_mem_object(
-            &gpu_context.queue_transfer,
-            &buffer.data_gpu,
-            &*temp2,
-            None::<Event>,
-            None::<&mut Event>,
-        )
-        .unwrap();
+        // The reader held the mapping while filling the buffer; unmapping here
+        // publishes its contents to the device. If the reader already released
+        // it (interrupt/read error), there is nothing left to flush.
+        if let Some(mapping) = buffer.buffer_ptr_host.as_ref() {
+            core::enqueue_unmap_mem_object(
+                &gpu_context.queue_transfer,
+                &buffer.data_gpu,
+                &*mapping,
+                None::<Event>,
+                None::<&mut Event>,
+            )
+            .unwrap();
+        }
     } else {
         unsafe {
             core::enqueue_write_buffer(
