@@ -76,6 +76,19 @@ For Windows distributions one of the `.exe` versions:
 The miner needs a **config.yaml** file.</br>
 Please download from the corresponding release.
 
+### Pool deadline limits
+
+A pool refuses shares whose deadline is worse than a limit of its own</br>
+("Deadline exceeds maximum allowed deadline") and does not advertise it in</br>
+`getMiningInfo`. The miner learns that limit from the pool's refusals and stops</br>
+offering shares the pool would throw away, so the error lines stop on their own</br>
+and no constant has to be kept in sync with the pool. Refused deadlines of a</br>
+fraction of a second are remembered as well, for the same reason.</br>
+
+What was learned is written to a `*.limits.json` file beside the config file</br>
+and trusted for a day; after that it is learned again, so a pool that raises</br>
+its limit is not filtered out forever. Deleting the file starts over.</br>
+
 ### Running
 Be sure to have the config file on the same folder of your binary.</br>
 

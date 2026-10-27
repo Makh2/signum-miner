@@ -352,7 +352,7 @@ fn scan_plots(
 }
 
 impl Miner {
-    pub fn new(cfg: Cfg, executor: Handle) -> Miner {
+    pub fn new(cfg: Cfg, executor: Handle, submission_limits: Arc<SubmissionLimits>) -> Miner {
         let (drive_id_to_plots, total_size) =
             scan_plots(&cfg.plot_dirs, cfg.hdd_use_direct_io, cfg.benchmark_cpu());
 
@@ -541,8 +541,6 @@ impl Miner {
 
         // Shared with the submission loop, which learns the pools' deadline
         // limits from their refusals while we read them here before sending.
-        let submission_limits = Arc::new(SubmissionLimits::new());
-
         Miner {
             reader_task_count: drive_id_to_plots.len(),
             reader: Reader::new(
