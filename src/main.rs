@@ -19,7 +19,6 @@ mod poc_hashing;
 mod reader;
 mod requests;
 mod shabal256;
-mod submission_limits;
 mod utils;
 
 #[cfg(feature = "opencl")]
@@ -29,11 +28,8 @@ mod ocl;
 
 use crate::config::load_cfg;
 use crate::miner::Miner;
-use crate::submission_limits::SubmissionLimits;
 use clap::{Arg, Command};
-use std::path::Path;
 use std::process;
-use std::sync::Arc;
 
 cfg_if! {
     if #[cfg(feature = "simd_avx512f")] {
@@ -145,10 +141,6 @@ async fn main() {
     let cfg_loaded = load_cfg(config);
     logger::init_logger(&cfg_loaded);
 
-    // The pools' deadline limits are learned from their refusals; keeping what
-    // was learned next to the config saves the same refusals after a restart.
-    let submission_limits = Arc::new(SubmissionLimits::load_for_config(Path::new(config)));
-
     info!(
         "{} v{}",
         env!("CARGO_PKG_NAME"),
@@ -180,6 +172,6 @@ async fn main() {
     ocl::gpu_info(&cfg_loaded);
 
     let handle = tokio::runtime::Handle::current();
-    let miner = Miner::new(cfg_loaded, handle, submission_limits);
+    let miner = Miner::new(cfg_loaded, handle);
     miner.run().await;
 }

@@ -12,7 +12,6 @@ use crate::plot::{Plot, SCOOP_SIZE};
 use crate::poc_hashing;
 use crate::reader::Reader;
 use crate::requests::RequestHandler;
-use crate::submission_limits::SubmissionLimits;
 use crate::utils::{get_device_id, new_thread_pool};
 use crossbeam_channel;
 use filetime::FileTime;
@@ -49,7 +48,6 @@ pub struct Miner {
     executor: Handle,
     wakeup_after: i64,
     submit_only_best: bool,
-    submission_limits: Arc<SubmissionLimits>,
 }
 
 pub struct State {
@@ -66,11 +64,6 @@ pub struct State {
     scoop: u32,
     first: bool,
     outage: bool,
-    /// Shares this round that were not sent because the pool had refused such
-    /// deadlines before. Counted so that the round summary can say how many
-    /// were dropped and why - a learned limit that silently eats shares is
-    /// exactly what nobody can see.
-    skipped_by_learned_limit: usize,
 }
 
 impl State {
@@ -89,7 +82,6 @@ impl State {
             scanning: false,
             first: true,
             outage: false,
-            skipped_by_learned_limit: 0,
         }
     }
 
@@ -97,7 +89,6 @@ impl State {
         for best_deadlines in self.account_id_to_best_deadline.values_mut() {
             *best_deadlines = u64::MAX;
         }
-        self.skipped_by_learned_limit = 0;
         self.height = mining_info.height;
         self.block += 1;
         self.base_target = mining_info.base_target;
@@ -359,7 +350,7 @@ fn scan_plots(
 }
 
 impl Miner {
-    pub fn new(cfg: Cfg, executor: Handle, submission_limits: Arc<SubmissionLimits>) -> Miner {
+    pub fn new(cfg: Cfg, executor: Handle) -> Miner {
         let (drive_id_to_plots, total_size) =
             scan_plots(&cfg.plot_dirs, cfg.hdd_use_direct_io, cfg.benchmark_cpu());
 
@@ -574,7 +565,6 @@ impl Miner {
                 cfg.send_proxy_details,
                 cfg.additional_headers,
                 executor.clone(),
-                submission_limits.clone(),
             ),
             state: Arc::new(Mutex::new(State::new())),
             // floor at 1s to protect servers
@@ -582,7 +572,6 @@ impl Miner {
             executor,
             wakeup_after: cfg.hdd_wakeup_after * 1000, // ms -> s
             submit_only_best : cfg.submit_only_best,
-            submission_limits,
         }
     }
 
@@ -676,7 +665,6 @@ impl Miner {
         let state = self.state.clone();
         let reader_task_count = self.reader_task_count;
         let inner_submit_only_best = self.submit_only_best;
-        let submission_limits = self.submission_limits.clone();
         self.executor.clone().spawn(
             ReceiverStream::new(self.rx_nonce_data)
                 .for_each(move |nonce_data| {
@@ -697,22 +685,17 @@ impl Miner {
                                         .unwrap_or(&target_deadline)),
                                 )
                         {
-                            // The round's best so far, whatever the learned
-                            // limits say about it: which share is the best one
-                            // is for the pool to judge, not for them. Updating
-                            // it only for offers the pool would accept would
-                            // make every later share look like an improvement.
+                            // The round's best so far. A pool refusing a share
+                            // costs a request and nothing else, so nothing is
+                            // held back on a guess about the pool's limit: the
+                            // answer is the only way to know it.
                             state
                                 .account_id_to_best_deadline
                                 .insert(nonce_data.account_id, deadline);
 
-                            // Pools refuse deadlines above a limit of theirs -
-                            // and the zero-second deadline itself - and never
-                            // advertise either, so we learn both from their
-                            // refusals and stop offering what they throw away.
                             if inner_submit_only_best {
                                 best_nonce_data = nonce_data.clone();
-                            } else if submission_limits.allows(nonce_data.height, deadline) {
+                            } else {
                                 request_handler.submit_nonce(
                                     nonce_data.account_id,
                                     nonce_data.nonce,
@@ -722,15 +705,6 @@ impl Miner {
                                     deadline,
                                     state.generation_signature_bytes,
                                 );
-                            } else {
-                                // Not worth a request: the pool has refused such
-                                // deadlines before. Counted, so the round
-                                // summary can say how many shares were dropped
-                                // and why - a learned limit that eats shares
-                                // silently is what nobody can see. The other
-                                // mode counts at the end of the round, where
-                                // the share it would have sent is known.
-                                state.skipped_by_learned_limit += 1;
                             }
                         }
 
@@ -752,35 +726,14 @@ impl Miner {
                                 // Submit now our best one, if configured that way
                                 if best_nonce_data.height == state.height {
                                     let deadline = best_nonce_data.deadline / best_nonce_data.base_target;
-                                    // What the pool accepts may have been
-                                    // learned while the round was running, so
-                                    // check it again before spending a request
-                                    // on the share.
-                                    if submission_limits.allows(best_nonce_data.height, deadline) {
-                                        request_handler.submit_nonce(
-                                            best_nonce_data.account_id,
-                                            best_nonce_data.nonce,
-                                            best_nonce_data.height,
-                                            best_nonce_data.block,
-                                            best_nonce_data.deadline,
-                                            deadline,
-                                            state.generation_signature_bytes,
-                                        );
-                                    } else {
-                                        state.skipped_by_learned_limit += 1;
-                                    }
-                                }
-
-                                if state.skipped_by_learned_limit > 0 {
-                                    info!(
-                                        "{: <80}",
-                                        format!(
-                                            "skipped {} share(s) the pool would refuse: {}",
-                                            state.skipped_by_learned_limit,
-                                            submission_limits
-                                                .describe(nonce_data.height)
-                                                .unwrap_or_else(|| "no limits known".to_owned()),
-                                        )
+                                    request_handler.submit_nonce(
+                                        best_nonce_data.account_id,
+                                        best_nonce_data.nonce,
+                                        best_nonce_data.height,
+                                        best_nonce_data.block,
+                                        best_nonce_data.deadline,
+                                        deadline,
+                                        state.generation_signature_bytes,
                                     );
                                 }
 

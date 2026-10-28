@@ -1,10 +1,8 @@
 use crate::com::api::{FetchError, MiningInfoResponse};
 use crate::com::client::{Client, ProxyDetails, SubmissionParameters};
 use crate::future::prio_retry::PrioRetry;
-use crate::submission_limits::{is_deadline_too_high, Learned, SubmissionLimits};
 use futures_util::stream::{StreamExt};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -25,7 +23,6 @@ impl RequestHandler {
         send_proxy_details: bool,
         additional_headers: HashMap<String, String>,
         handle: tokio::runtime::Handle,
-        limits: Arc<SubmissionLimits>,
     ) -> RequestHandler {
         let proxy_details = if send_proxy_details {
             ProxyDetails::Enabled
@@ -48,7 +45,6 @@ impl RequestHandler {
             rx_submit_nonce_data,
             tx_submit_data.clone(),
             handle,
-            limits,
         );
 
         RequestHandler {
@@ -62,7 +58,6 @@ impl RequestHandler {
         rx: mpsc::UnboundedReceiver<SubmissionParameters>,
         tx_submit_data: mpsc::UnboundedSender<SubmissionParameters>,
         handle: tokio::runtime::Handle,
-        limits: Arc<SubmissionLimits>,
     ) {
         handle.spawn(async move {
             let wrapped_rx = UnboundedReceiverStream::new(rx);
@@ -85,6 +80,7 @@ impl RequestHandler {
                             );
                         } else {
                             log_submission_accepted(
+                                submission_params.height,
                                 submission_params.account_id,
                                 submission_params.nonce,
                                 submission_params.deadline,
@@ -94,6 +90,7 @@ impl RequestHandler {
                     Err(FetchError::Pool(e)) => {
                         if e.message.is_empty() || e.message == "limit exceeded" {
                             log_pool_busy(
+                                submission_params.height,
                                 submission_params.account_id,
                                 submission_params.nonce,
                                 submission_params.deadline,
@@ -102,21 +99,6 @@ impl RequestHandler {
                                 error!("can't send submission params");
                             }
                         } else {
-                            // The pool telling us the deadline was too high is
-                            // the only hint about where its limit is, so learn
-                            // from it instead of guessing a constant.
-                            if is_deadline_too_high(&e.message) {
-                                if let Some(learned) = limits
-                                    .on_rejected(submission_params.height, submission_params.deadline)
-                                {
-                                    log_learned_limit(
-                                        learned,
-                                        submission_params.height,
-                                        submission_params.deadline,
-                                        submission_params.account_id,
-                                    );
-                                }
-                            }
                             log_submission_not_accepted(
                                 submission_params.height,
                                 submission_params.account_id,
@@ -129,6 +111,7 @@ impl RequestHandler {
                     }
                     Err(FetchError::Http(x)) => {
                         log_submission_failed(
+                            submission_params.height,
                             submission_params.account_id,
                             submission_params.nonce,
                             submission_params.deadline,
@@ -200,13 +183,22 @@ fn log_deadline_mismatch(
     );
 }
 
-fn log_submission_failed(account_id: u64, nonce: u64, deadline: u64, err: &str) {
+fn log_submission_failed(
+    height: u64,
+    account_id: u64,
+    nonce: u64,
+    deadline: u64,
+    err: &str,
+) {
+    // A request that did not reach the pool is worth a warning, but the line
+    // still has to fit in the console: the details go to the debug log.
     warn!(
-        "{: <80}",
-        format!(
-            "submission failed, retrying: account={}, nonce={}, deadline={}, description={}",
-            account_id, nonce, deadline, err
-        )
+        "submission failed, retrying: height={}, deadline={}: {}",
+        height, deadline, err
+    );
+    debug!(
+        "submission failed, retrying: height={}, account={}, nonce={}, deadline={}, description={}",
+        height, account_id, nonce, deadline, err,
     );
 }
 
@@ -218,39 +210,40 @@ fn log_submission_not_accepted(
     err_code: i32,
     msg: &str,
 ) {
-    error!(
-        "submission not accepted: height={}, account={}, nonce={}, \
-         deadline={}\n\tcode: {}\n\tmessage: {}",
+    // A pool refusing a share is its answer, not a failure of the miner: one
+    // short line at info that stays inside the console, and the whole record
+    // at debug for when it is needed. This used to be one long red line
+    // wrapping over three, which made a normal refusal look like a fault.
+    info!(
+        "refused: height={}, deadline={}: {}",
+        height, deadline, msg
+    );
+    debug!(
+        "refused: height={}, account={}, nonce={}, deadline={}, code={}, message={}",
         height, account_id, nonce, deadline, err_code, msg,
     );
 }
 
-fn log_learned_limit(learned: Learned, height: u64, deadline: u64, account_id: u64) {
-    match learned {
-        Learned::Ceiling(limit) => info!(
-            "learned submission limit: no longer submitting deadlines above {}s for height={} \
-             (pool refused {}s), account={}",
-            limit, height, deadline, account_id,
-        ),
-        Learned::Floor(limit) => info!(
-            "learned submission limit: no longer submitting deadlines at or below {}s for \
-             height={} (pool refused {}s), account={}",
-            limit, height, deadline, account_id,
-        ),
-    }
-}
-
-fn log_submission_accepted(account_id: u64, nonce: u64, deadline: u64) {
-    info!(
-        "deadline accepted: account={}, nonce={}, deadline={}",
-        account_id, nonce, deadline
+fn log_submission_accepted(
+    height: u64,
+    account_id: u64,
+    nonce: u64,
+    deadline: u64,
+) {
+    // Same shape as the refusal above, for the same reason: the account is the
+    // same on every line of a run and the nonce is only for the debug log.
+    info!("accepted: height={}, deadline={}", height, deadline);
+    debug!(
+        "accepted: height={}, account={}, nonce={}, deadline={}",
+        height, account_id, nonce, deadline,
     );
 }
 
-fn log_pool_busy(account_id: u64, nonce: u64, deadline: u64) {
-    info!(
-        "pool busy, retrying: account={}, nonce={}, deadline={}",
-        account_id, nonce, deadline
+fn log_pool_busy(height: u64, account_id: u64, nonce: u64, deadline: u64) {
+    info!("pool busy, retrying: height={}, deadline={}", height, deadline);
+    debug!(
+        "pool busy, retrying: height={}, account={}, nonce={}, deadline={}",
+        height, account_id, nonce, deadline,
     );
 }
 
@@ -279,7 +272,6 @@ mod tests {
         true,
         HashMap::new(),
         handle,
-        Arc::new(SubmissionLimits::new()),
     );
 
     request_handler.submit_nonce(1337, 12, 111, 0, 7123, 1193, [0; 32]);
