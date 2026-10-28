@@ -160,10 +160,23 @@ fn log_deadline_mismatch(
     deadline: u64,
     deadline_pool: u64,
 ) {
-    error!(
-        "submit: deadlines mismatch, height={}, account={}, nonce={}, \
-         deadline_miner={}, deadline_pool={}",
-        height, account_id, nonce, deadline, deadline_pool
+    // The pool echoes the deadline in its own scale (the raw value, or one
+    // computed from its own base target), so the two numbers almost never
+    // match. That is a measurement, not an error: the ratio tells how far the
+    // pool's scale is from ours.
+    debug!(
+        "submit: pool echoed a different deadline scale, height={}, account={}, nonce={}, \
+         deadline_miner={}, deadline_pool={}, ratio={:.3}",
+        height,
+        account_id,
+        nonce,
+        deadline,
+        deadline_pool,
+        if deadline > 0 {
+            deadline_pool as f64 / deadline as f64
+        } else {
+            0.0
+        },
     );
 }
 
