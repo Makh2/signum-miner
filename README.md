@@ -86,8 +86,12 @@ and no constant has to be kept in sync with the pool. Refused deadlines of a</br
 fraction of a second are remembered as well, for the same reason.</br>
 
 What was learned is written to a `*.limits.json` file beside the config file</br>
-and trusted for a day; after that it is learned again, so a pool that raises</br>
-its limit is not filtered out forever. Deleting the file starts over.</br>
+and learned again when it grows stale: a ceiling - the largest deadline worth</br>
+sending - after six hours, an extreme refused deadline after a day. A pool that</br>
+raises its limit is therefore not filtered out forever, and the round summary</br>
+counts the shares the limits dropped, so a limit that has grown too strict is</br>
+visible in the log instead of eating shares silently. Deleting the file starts</br>
+over.</br>
 
 ### Running
 Be sure to have the config file on the same folder of your binary.</br>

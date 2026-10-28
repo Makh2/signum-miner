@@ -66,6 +66,11 @@ pub struct State {
     scoop: u32,
     first: bool,
     outage: bool,
+    /// Shares this round that were not sent because the pool had refused such
+    /// deadlines before. Counted so that the round summary can say how many
+    /// were dropped and why - a learned limit that silently eats shares is
+    /// exactly what nobody can see.
+    skipped_by_learned_limit: usize,
 }
 
 impl State {
@@ -84,6 +89,7 @@ impl State {
             scanning: false,
             first: true,
             outage: false,
+            skipped_by_learned_limit: 0,
         }
     }
 
@@ -91,6 +97,7 @@ impl State {
         for best_deadlines in self.account_id_to_best_deadline.values_mut() {
             *best_deadlines = u64::MAX;
         }
+        self.skipped_by_learned_limit = 0;
         self.height = mining_info.height;
         self.block += 1;
         self.base_target = mining_info.base_target;
@@ -689,20 +696,23 @@ impl Miner {
                                         .get(&nonce_data.account_id)
                                         .unwrap_or(&target_deadline)),
                                 )
+                        {
+                            // The round's best so far, whatever the learned
+                            // limits say about it: which share is the best one
+                            // is for the pool to judge, not for them. Updating
+                            // it only for offers the pool would accept would
+                            // make every later share look like an improvement.
+                            state
+                                .account_id_to_best_deadline
+                                .insert(nonce_data.account_id, deadline);
+
                             // Pools refuse deadlines above a limit of theirs -
                             // and the zero-second deadline itself - and never
                             // advertise either, so we learn both from their
                             // refusals and stop offering what they throw away.
-                            && submission_limits.allows(nonce_data.height, deadline)
-                        {
-                            state
-                                .account_id_to_best_deadline
-                                .insert(nonce_data.account_id, deadline);
-                            
                             if inner_submit_only_best {
                                 best_nonce_data = nonce_data.clone();
-                            }
-                            else {
+                            } else if submission_limits.allows(nonce_data.height, deadline) {
                                 request_handler.submit_nonce(
                                     nonce_data.account_id,
                                     nonce_data.nonce,
@@ -712,6 +722,15 @@ impl Miner {
                                     deadline,
                                     state.generation_signature_bytes,
                                 );
+                            } else {
+                                // Not worth a request: the pool has refused such
+                                // deadlines before. Counted, so the round
+                                // summary can say how many shares were dropped
+                                // and why - a learned limit that eats shares
+                                // silently is what nobody can see. The other
+                                // mode counts at the end of the round, where
+                                // the share it would have sent is known.
+                                state.skipped_by_learned_limit += 1;
                             }
                         }
 
@@ -747,7 +766,22 @@ impl Miner {
                                             deadline,
                                             state.generation_signature_bytes,
                                         );
+                                    } else {
+                                        state.skipped_by_learned_limit += 1;
                                     }
+                                }
+
+                                if state.skipped_by_learned_limit > 0 {
+                                    info!(
+                                        "{: <80}",
+                                        format!(
+                                            "skipped {} share(s) the pool would refuse: {}",
+                                            state.skipped_by_learned_limit,
+                                            submission_limits
+                                                .describe(nonce_data.height)
+                                                .unwrap_or_else(|| "no limits known".to_owned()),
+                                        )
+                                    );
                                 }
 
                                 state.sw.restart();
