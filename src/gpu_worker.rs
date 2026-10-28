@@ -1,11 +1,29 @@
 use crate::miner::{Buffer, NonceData};
 use crate::ocl::GpuContext;
 use crate::ocl::{gpu_hash, gpu_transfer};
-use crate::reader::ReadReply;
+use crate::reader::{BufferInfo, ReadReply};
 use crossbeam_channel::{Receiver, Sender};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::u64;
 use tokio::sync::mpsc::Sender as TokioSender;
+
+/// How many hashing failures in a row before this worker stops hashing.
+const MAX_FAILURES: u32 = 5;
+
+/// A drive that reached the end of its plots, so the miner can count it and
+/// close the round.
+fn report_drive_finished(tx_nonce_data: &TokioSender<NonceData>, info: &BufferInfo) {
+    let _ = tx_nonce_data.blocking_send(NonceData {
+        height: info.height,
+        block: info.block,
+        base_target: info.base_target,
+        deadline: u64::MAX,
+        nonce: 0,
+        reader_task_processed: true,
+        account_id: info.account_id,
+    });
+}
 
 pub fn create_gpu_worker_task(
     benchmark: bool,
@@ -15,54 +33,90 @@ pub fn create_gpu_worker_task(
     context_mu: Arc<GpuContext>,
 ) -> impl FnOnce() + Send + 'static {
     move || {
+        // Failures in a row. A worker whose OpenCL calls keep failing cannot
+        // hash anything any more, but it can still hand the buffers back, and
+        // that alone is what keeps the rounds closing.
+        let mut failures = 0u32;
+        let mut gave_up = false;
+
         for read_reply in rx_read_replies {
             let buffer = read_reply.buffer;
+            let info = read_reply.info;
             // handle empty buffers (read errors) && benchmark
-            if read_reply.info.len == 0 || benchmark {
+            if info.len == 0 || benchmark {
                 // forward 'drive finished signal'
-                if read_reply.info.finished {
-                    let deadline = u64::MAX;
-                    let _ = tx_nonce_data.blocking_send(NonceData {
-                        height: read_reply.info.height,
-                        block: read_reply.info.block,
-                        base_target: read_reply.info.base_target,
-                        deadline,
-                        nonce: 0,
-                        reader_task_processed: read_reply.info.finished,
-                        account_id: read_reply.info.account_id,
-                    });
+                if info.finished {
+                    report_drive_finished(&tx_nonce_data, &info);
                 }
                 let _ = tx_empty_buffers.send(buffer);
                 continue;
             }
 
             // consume and ignore all signals
-            if read_reply.info.len == 1 && read_reply.info.gpu_signal > 0 {
+            if info.len == 1 && info.gpu_signal > 0 {
                 continue;
             }
 
-            gpu_transfer(
-                &context_mu,
-                buffer.get_gpu_buffers().unwrap(),
-                *read_reply.info.gensig,
-            );
-            let result = gpu_hash(
-                &context_mu,
-                read_reply.info.len / 64,
-                buffer.get_gpu_data().as_ref().unwrap(),
-            );
-            let deadline = result.0;
-            let offset = result.1;
+            if gave_up {
+                if info.finished {
+                    report_drive_finished(&tx_nonce_data, &info);
+                }
+                let _ = tx_empty_buffers.send(buffer);
+                continue;
+            }
 
-            let _ = tx_nonce_data.blocking_send(NonceData {
-                height: read_reply.info.height,
-                block: read_reply.info.block,
-                base_target: read_reply.info.base_target,
-                deadline,
-                nonce: offset + read_reply.info.start_nonce,
-                reader_task_processed: read_reply.info.finished,
-                account_id: read_reply.info.account_id,
-            });
+            // An OpenCL call that fails panics - ocl.rs unwraps its results -
+            // and a panicking worker used to take the round down with it: the
+            // buffer never came back, the drive task waiting for it never
+            // reached the end of its plots, and the round could never close, so
+            // the miner went silent until someone restarted it. Catch it here
+            // instead: say what happened, hand the buffer back, carry on.
+            let hashed = panic::catch_unwind(AssertUnwindSafe(|| {
+                gpu_transfer(
+                    &context_mu,
+                    buffer.get_gpu_buffers().unwrap(),
+                    *info.gensig,
+                );
+                gpu_hash(
+                    &context_mu,
+                    info.len / 64,
+                    buffer.get_gpu_data().as_ref().unwrap(),
+                )
+            }));
+
+            match hashed {
+                Ok((deadline, offset)) => {
+                    failures = 0;
+                    let _ = tx_nonce_data.blocking_send(NonceData {
+                        height: info.height,
+                        block: info.block,
+                        base_target: info.base_target,
+                        deadline,
+                        nonce: offset + info.start_nonce,
+                        reader_task_processed: info.finished,
+                        account_id: info.account_id,
+                    });
+                }
+                Err(_) => {
+                    failures += 1;
+                    error!(
+                        "GPU worker: hashing failed at height={}, window starting at nonce={} \
+                         ({} in a row) -> dropping this window and returning the buffer",
+                        info.height, info.start_nonce, failures
+                    );
+                    if failures >= MAX_FAILURES {
+                        gave_up = true;
+                        error!(
+                            "GPU worker: giving up hashing after {} failures in a row; buffers will \
+                             still be returned and rounds will still close, but no shares come \
+                             from this worker any more",
+                            failures
+                        );
+                    } else if info.finished {
+                        report_drive_finished(&tx_nonce_data, &info);
+                    }
+                }
+            }
 
             let _ = tx_empty_buffers.send(buffer);
         }

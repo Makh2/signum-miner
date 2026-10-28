@@ -36,10 +36,17 @@ use tokio::runtime::Handle;
 use page_size;
 
 
+/// How long a round may stay open before the watchdog closes it. A round takes
+/// about twenty seconds, so this only fires when something is really stuck.
+const ROUND_STALL_MS: i64 = 90_000;
+
 pub struct Miner {
     reader: Reader,
     request_handler: RequestHandler,
     rx_nonce_data: mpsc::Receiver<NonceData>,
+    /// Kept so the round watchdog can close a round that a stuck drive or a
+    /// dead hashing worker would otherwise leave open for good.
+    tx_nonce_data: mpsc::Sender<NonceData>,
     target_deadline: u64,
     account_id_to_target_deadline: HashMap<u64, u64>,
     state: Arc<Mutex<State>>,
@@ -64,6 +71,11 @@ pub struct State {
     scoop: u32,
     first: bool,
     outage: bool,
+    /// How long the round being scanned has been running, and whether the
+    /// watchdog has already said that it is not closing. A round that never
+    /// closes used to be silent: no submissions, no lines, nothing to see.
+    round_sw: Stopwatch,
+    stalled_warned: bool,
 }
 
 impl State {
@@ -82,6 +94,8 @@ impl State {
             scanning: false,
             first: true,
             outage: false,
+            round_sw: Stopwatch::new(),
+            stalled_warned: false,
         }
     }
 
@@ -89,6 +103,8 @@ impl State {
         for best_deadlines in self.account_id_to_best_deadline.values_mut() {
             *best_deadlines = u64::MAX;
         }
+        self.round_sw.restart();
+        self.stalled_warned = false;
         self.height = mining_info.height;
         self.block += 1;
         self.base_target = mining_info.base_target;
@@ -537,8 +553,8 @@ impl Miner {
         #[cfg(not(feature = "opencl"))]
         let tx_read_replies_gpu = None;
 
-        // Shared with the submission loop, which learns the pools' deadline
-        // limits from their refusals while we read them here before sending.
+        // The round watchdog and the submission loop both need the nonce
+        // channel's sender: the first to close a round that got stuck.
         Miner {
             reader_task_count: drive_id_to_plots.len(),
             reader: Reader::new(
@@ -555,6 +571,7 @@ impl Miner {
                 cfg.benchmark_cpu(),
             ),
             rx_nonce_data,
+            tx_nonce_data: tx_nonce_data.clone(),
             target_deadline: cfg.target_deadline,
             account_id_to_target_deadline: cfg.account_id_to_target_deadline,
             request_handler: RequestHandler::new(
@@ -589,6 +606,8 @@ impl Miner {
         // there might be a way to solve this without two nested moves
         let get_mining_info_interval = self.get_mining_info_interval;
         let wakeup_after = self.wakeup_after;
+        let tx_nonce_data = self.tx_nonce_data.clone();
+        let reader_task_count = self.reader_task_count;
         tokio::spawn(async move {
             info!("→ Interval task started");
             Interval::new_interval(Duration::from_millis(get_mining_info_interval))
@@ -596,6 +615,7 @@ impl Miner {
                     let state = state.clone();
                     let reader = reader.clone();
                     let request_handler = request_handler.clone();
+                    let tx_nonce_data = tx_nonce_data.clone();
                     async move {
                         let mining_info = request_handler.get_mining_info();
                         match mining_info.await {
@@ -616,6 +636,38 @@ impl Miner {
                                         &Arc::new(state.generation_signature_bytes),
                                     );
                                     drop(state);
+                                } else if state.height > 0
+                                    && state.processed_reader_tasks < reader_task_count
+                                    && state.round_sw.elapsed_ms() > ROUND_STALL_MS
+                                {
+                                    // A round that does not close: a drive task is
+                                    // waiting for a buffer that never comes back, or
+                                    // a hashing worker is gone. Close the round so
+                                    // the miner keeps submitting what it found, and
+                                    // say why - silence was the only symptom before.
+                                    if !state.stalled_warned {
+                                        state.stalled_warned = true;
+                                        error!(
+                                            "round for height={} has not closed for {}s ({} of {} \
+                                             reader tasks reported) -> closing it and carrying on",
+                                            state.height,
+                                            state.round_sw.elapsed_ms() / 1000,
+                                            state.processed_reader_tasks,
+                                            reader_task_count
+                                        );
+                                    }
+                                    let (height, block, base_target) =
+                                        (state.height, state.block, state.base_target);
+                                    drop(state);
+                                    let _ = tx_nonce_data.try_send(NonceData {
+                                        height,
+                                        block,
+                                        base_target,
+                                        deadline: u64::MAX,
+                                        nonce: 0,
+                                        reader_task_processed: true,
+                                        account_id: 0,
+                                    });
                                 } else if !state.scanning
                                     && wakeup_after != 0
                                     && state.sw.elapsed_ms() > wakeup_after

@@ -10,7 +10,16 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Stdout;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use stopwatch::Stopwatch;
+
+/// How long a drive task waits for a free buffer before looking around again.
+const BUFFER_WAIT_MS: u64 = 500;
+
+/// How long a drive task keeps waiting for a buffer before it gives up on the
+/// round. A buffer that never comes back means the hashing side is stuck, and
+/// waiting for it forever used to hang the round for good.
+const BUFFER_GIVE_UP_MS: u64 = 60_000;
 
 pub struct BufferInfo {
     pub len: usize,
@@ -188,6 +197,7 @@ impl Reader {
             let mut sw = Stopwatch::new();
             let mut elapsed = 0i64;
             let mut nonces_processed = 0u64;
+            let mut waited_ms = 0u64;
             let plot_count = plots.len();
             'outer: for (i_p, p) in plots.iter().enumerate() {
                 let mut p = p.lock().unwrap();
@@ -199,7 +209,37 @@ impl Reader {
                     continue 'outer;
                 }
 
-                'inner: for mut buffer in rx_empty_buffers.clone() {
+                // The buffers come back when the hashing side is done with them.
+                // Waiting for one forever - because a hashing worker is stuck or
+                // gone - used to block this task and its pool thread for good,
+                // and then the round could never close: the miner went silent
+                // until someone restarted it. So wait with a timeout, notice a
+                // replaced round while waiting, and give up on this drive after
+                // a minute, saying why.
+                'inner: loop {
+                    let mut buffer = match rx_empty_buffers.recv_timeout(Duration::from_millis(BUFFER_WAIT_MS)) {
+                        Ok(buffer) => buffer,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break 'outer,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            if rx_interupt.try_recv().is_ok() {
+                                break 'outer;
+                            }
+                            waited_ms += BUFFER_WAIT_MS;
+                            if waited_ms >= BUFFER_GIVE_UP_MS {
+                                error!(
+                                    "reader {}: no free buffer for {}s while scanning height={}, \
+                                     scoop={} -> giving up on this drive for this round",
+                                    drive,
+                                    waited_ms / 1000,
+                                    height,
+                                    scoop
+                                );
+                                break 'outer;
+                            }
+                            continue;
+                        }
+                    };
+                    waited_ms = 0;
                     if show_drive_stats {
                         sw.restart();
                     }
@@ -219,54 +259,71 @@ impl Reader {
 
                     if rx_interupt.try_recv().is_ok() {
                         buffer.unmap();
-                        tx_empty_buffers.send(buffer).unwrap();
+                        let _ = tx_empty_buffers.send(buffer);
                         break 'outer;
                     }
 
                     let finished = i_p == (plot_count - 1) && next_plot;
-                    // buffer routing
+                    // buffer routing. A send to a worker that died (a panicked
+                    // OpenCL call, say) used to panic this task too, which cost
+                    // the round its completion and blocked a pool thread; now the
+                    // buffer comes back to the pool and the drive says so.
                     #[cfg(feature = "opencl")]
                     match buffer.get_id() {
                         0 => {
-                            tx_read_replies_cpu
-                                .send(ReadReply {
-                                    buffer,
-                                    info: BufferInfo {
-                                        len: bytes_read,
-                                        height,
-                                        block,
-                                        base_target,
-                                        gensig: gensig.clone(),
-                                        start_nonce,
-                                        finished,
-                                        account_id: p.meta.account_id,
-                                        gpu_signal: 0,
-                                    },
-                                })
-                                .expect("failed to send read data to CPU thread");
+                            let reply = ReadReply {
+                                buffer,
+                                info: BufferInfo {
+                                    len: bytes_read,
+                                    height,
+                                    block,
+                                    base_target,
+                                    gensig: gensig.clone(),
+                                    start_nonce,
+                                    finished,
+                                    account_id: p.meta.account_id,
+                                    gpu_signal: 0,
+                                },
+                            };
+                            if let Err(err) = tx_read_replies_cpu.send(reply) {
+                                error!(
+                                    "reader {}: CPU worker is gone (height={}, scoop={}) -> \
+                                     returning the buffer",
+                                    drive, height, scoop
+                                );
+                                let _ = tx_empty_buffers.send(err.0.buffer);
+                                break 'outer;
+                            }
                         }
                         i => {
-                            tx_read_replies_gpu.as_ref().unwrap()[i - 1]
-                                .send(ReadReply {
-                                    buffer,
-                                    info: BufferInfo {
-                                        len: bytes_read,
-                                        height,
-                                        block,
-                                        base_target,
-                                        gensig: gensig.clone(),
-                                        start_nonce,
-                                        finished,
-                                        account_id: p.meta.account_id,
-                                        gpu_signal: 0,
-                                    },
-                                })
-                                .expect("failed to send read data to GPU thread A");
+                            let reply = ReadReply {
+                                buffer,
+                                info: BufferInfo {
+                                    len: bytes_read,
+                                    height,
+                                    block,
+                                    base_target,
+                                    gensig: gensig.clone(),
+                                    start_nonce,
+                                    finished,
+                                    account_id: p.meta.account_id,
+                                    gpu_signal: 0,
+                                },
+                            };
+                            if let Err(err) = tx_read_replies_gpu.as_ref().unwrap()[i - 1].send(reply) {
+                                error!(
+                                    "reader {}: GPU worker {} is gone (height={}, scoop={}) -> \
+                                     returning the buffer",
+                                    drive, i, height, scoop
+                                );
+                                let _ = tx_empty_buffers.send(err.0.buffer);
+                                break 'outer;
+                            }
                         }
                     }
                     #[cfg(not(feature = "opencl"))]
-                    tx_read_replies_cpu
-                        .send(ReadReply {
+                    {
+                        let reply = ReadReply {
                             buffer,
                             info: BufferInfo {
                                 len: bytes_read,
@@ -279,8 +336,17 @@ impl Reader {
                                 account_id: p.meta.account_id,
                                 gpu_signal: 0,
                             },
-                        })
-                        .unwrap();
+                        };
+                        if let Err(err) = tx_read_replies_cpu.send(reply) {
+                            error!(
+                                "reader {}: CPU worker is gone (height={}, scoop={}) -> \
+                                 returning the buffer",
+                                drive, height, scoop
+                            );
+                            let _ = tx_empty_buffers.send(err.0.buffer);
+                            break 'outer;
+                        }
+                    }
 
                     nonces_processed += bytes_read as u64 / 64;
 
@@ -300,22 +366,22 @@ impl Reader {
                     if finished {
                         #[cfg(feature = "opencl")]
                         for i in 0..tx_read_replies_gpu.as_ref().unwrap().len() {
-                            tx_read_replies_gpu.as_ref().unwrap()[i]
-                                .send(ReadReply {
-                                    buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
-                                    info: BufferInfo {
-                                        len: 1,
-                                        height,
-                                        block,
-                                        base_target,
-                                        gensig: gensig.clone(),
-                                        start_nonce: 0,
-                                        finished: false,
-                                        account_id: 0,
-                                        gpu_signal: 2,
-                                    },
-                                })
-                                .expect("Error sending 'drive finished' signal to GPU thread A");
+                            // A signal for a worker that is gone is worth no more
+                            // than its buffer - never worth a panic here.
+                            let _ = tx_read_replies_gpu.as_ref().unwrap()[i].send(ReadReply {
+                                buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
+                                info: BufferInfo {
+                                    len: 1,
+                                    height,
+                                    block,
+                                    base_target,
+                                    gensig: gensig.clone(),
+                                    start_nonce: 0,
+                                    finished: false,
+                                    account_id: 0,
+                                    gpu_signal: 2,
+                                },
+                            });
                         }
                     }
 
