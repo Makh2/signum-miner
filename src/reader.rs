@@ -9,8 +9,10 @@ use pbr::{ProgressBar, Units};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Stdout;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use stopwatch::Stopwatch;
 
 /// How long a drive task waits for a free buffer before looking around again.
@@ -20,6 +22,79 @@ const BUFFER_WAIT_MS: u64 = 500;
 /// round. A buffer that never comes back means the hashing side is stuck, and
 /// waiting for it forever used to hang the round for good.
 const BUFFER_GIVE_UP_MS: u64 = 60_000;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// What one drive's reader task is doing right now.
+///
+/// A task that never comes back from a disk read - or from a driver call it
+/// makes on the way - used to be invisible: no line, no report, and the round
+/// it belonged to simply never closed. Worse, the next round started another
+/// task for the same drive, which blocked on the plot file the stuck task still
+/// held, so one stuck drive could cost the round its completion for good. The
+/// slot makes a stuck drive nameable, and lets a round go ahead without it.
+pub struct DriveSlot {
+    busy: AtomicBool,
+    started_ms: AtomicU64,
+    progress_ms: AtomicU64,
+    height: AtomicU64,
+}
+
+impl DriveSlot {
+    fn new() -> Self {
+        Self {
+            busy: AtomicBool::new(false),
+            started_ms: AtomicU64::new(0),
+            progress_ms: AtomicU64::new(0),
+            height: AtomicU64::new(0),
+        }
+    }
+
+    /// Take the drive for a round. False means its previous task is still in
+    /// there, so this round must go on without it.
+    fn try_start(&self, height: u64) -> bool {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let now = now_ms();
+            self.started_ms.store(now, Ordering::SeqCst);
+            self.progress_ms.store(now, Ordering::SeqCst);
+            self.height.store(height, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A chunk was read or handed over: the drive is alive.
+    fn progress(&self) {
+        self.progress_ms.store(now_ms(), Ordering::SeqCst);
+    }
+
+    /// The task has left, whatever the reason. Only the task that took the slot
+    /// releases it, so a stale task cannot free a drive that a newer one holds.
+    fn release(&self) {
+        self.busy.store(false, Ordering::SeqCst);
+    }
+
+    /// How long the previous task has been in this drive, and how long ago it
+    /// last showed any progress.
+    fn stuck_for(&self) -> (u64, u64, u64) {
+        let now = now_ms();
+        (
+            now.saturating_sub(self.started_ms.load(Ordering::SeqCst)) / 1000,
+            now.saturating_sub(self.progress_ms.load(Ordering::SeqCst)) / 1000,
+            self.height.load(Ordering::SeqCst),
+        )
+    }
+}
 
 pub struct BufferInfo {
     pub len: usize,
@@ -47,6 +122,9 @@ pub struct Reader {
     tx_read_replies_cpu: Sender<ReadReply>,
     tx_read_replies_gpu: Option<Vec<Sender<ReadReply>>>,
     interupts: Vec<Sender<()>>,
+    /// One slot per drive, so a task that never returns can be named and the
+    /// round can be scanned without that drive instead of never closing.
+    drive_slots: Arc<HashMap<String, Arc<DriveSlot>>>,
     show_progress: bool,
     show_drive_stats: bool,
 }
@@ -69,6 +147,13 @@ impl Reader {
             check_overlap(&drive_id_to_plots);
         }
 
+        let drive_slots: Arc<HashMap<String, Arc<DriveSlot>>> = Arc::new(
+            drive_id_to_plots
+                .keys()
+                .map(|drive| (drive.clone(), Arc::new(DriveSlot::new())))
+                .collect(),
+        );
+
         Reader {
             drive_id_to_plots,
             total_size,
@@ -78,11 +163,17 @@ impl Reader {
             tx_read_replies_cpu,
             tx_read_replies_gpu,
             interupts: Vec::new(),
+            drive_slots,
             show_progress,
             show_drive_stats,
         }
     }
 
+    /// Starts one reader task per drive and returns how many drives could not be
+    /// started because their previous task never came back. A round with a stuck
+    /// drive has to be able to close anyway - the caller counts the skipped
+    /// drives as reported - otherwise one bad read stops every share until
+    /// someone restarts the miner.
     pub fn start_reading(
         &mut self,
         height: u64,
@@ -90,7 +181,7 @@ impl Reader {
         base_target: u64,
         scoop: u32,
         gensig: &Arc<[u8; 32]>,
-    ) {
+    ) -> usize {
         for interupt in &self.interupts {
             interupt.send(()).ok();
         }
@@ -131,40 +222,63 @@ impl Reader {
             }
         }
 
-        self.interupts = self
-            .drive_id_to_plots
-            .iter()
-            .map(|(drive, plots)| {
-                let (interupt, task) = if self.show_progress {
-                    self.create_read_task(
-                        Some(pb.clone()),
-                        drive.clone(),
-                        plots.clone(),
-                        height,
-                        block,
-                        base_target,
-                        scoop,
-                        gensig.clone(),
-                        self.show_drive_stats,
-                    )
-                } else {
-                    self.create_read_task(
-                        None,
-                        drive.clone(),
-                        plots.clone(),
-                        height,
-                        block,
-                        base_target,
-                        scoop,
-                        gensig.clone(),
-                        self.show_drive_stats,
-                    )
-                };
+        let mut interupts = Vec::new();
+        let mut skipped = 0usize;
+        for (drive, plots) in self.drive_id_to_plots.iter() {
+            let slot = match self.drive_slots.get(drive) {
+                Some(slot) => slot.clone(),
+                None => continue,
+            };
+            if !slot.try_start(height) {
+                let (busy_s, silent_s, stuck_height) = slot.stuck_for();
+                error!(
+                    "reader {}: still busy with height={} for {}s (no progress for {}s) -> \
+                     scanning height={} without this drive, the round will close without it",
+                    drive, stuck_height, busy_s, silent_s, height
+                );
+                skipped += 1;
+                continue;
+            }
+            let (interupt, task) = if self.show_progress {
+                self.create_read_task(
+                    Some(pb.clone()),
+                    drive.clone(),
+                    plots.clone(),
+                    height,
+                    block,
+                    base_target,
+                    scoop,
+                    gensig.clone(),
+                    self.show_drive_stats,
+                    slot,
+                )
+            } else {
+                self.create_read_task(
+                    None,
+                    drive.clone(),
+                    plots.clone(),
+                    height,
+                    block,
+                    base_target,
+                    scoop,
+                    gensig.clone(),
+                    self.show_drive_stats,
+                    slot,
+                )
+            };
 
-                self.pool.spawn(task);
-                interupt
-            })
-            .collect();
+            self.pool.spawn(task);
+            interupts.push(interupt);
+        }
+        self.interupts = interupts;
+        skipped
+    }
+
+    /// How many buffers are waiting to be filled right now. Zero means the
+    /// hashing side holds them all, which is the one state in which no drive can
+    /// read anything - worth saying out loud in the round watchdog.
+    pub fn free_buffers(&self) -> usize {
+        self.rx_empty_buffers.len()
     }
 
     pub fn wakeup(&mut self) {
@@ -194,6 +308,7 @@ impl Reader {
         scoop: u32,
         gensig: Arc<[u8; 32]>,
         show_drive_stats: bool,
+        slot: Arc<DriveSlot>,
     ) -> (Sender<()>, impl FnOnce()) {
         let (tx_interupt, rx_interupt) = crossbeam_channel::unbounded();
         let rx_empty_buffers = self.rx_empty_buffers.clone();
@@ -202,7 +317,14 @@ impl Reader {
         #[cfg(feature = "opencl")]
         let tx_read_replies_gpu = self.tx_read_replies_gpu.clone();
 
-        (tx_interupt, move || {
+        // The task itself runs under `catch_unwind`: an unexpected panic in a
+        // rayon task does not kill this thread only, it aborts the whole process
+        // ("Rayon: detected unexpected panic; aborting"), and the drive's slot
+        // would stay taken forever. The whole task costs one round if it panics,
+        // and the drive is given back so the next round can use it.
+        let release_slot = slot.clone();
+        let drive_name = drive.clone();
+        let body = move || {
             let mut sw = Stopwatch::new();
             let mut elapsed = 0i64;
             let mut nonces_processed = 0u64;
@@ -249,6 +371,7 @@ impl Reader {
                         }
                     };
                     waited_ms = 0;
+                    slot.progress();
                     if show_drive_stats {
                         sw.restart();
                     }
@@ -265,6 +388,7 @@ impl Reader {
                             (0, 0, true)
                         }
                     };
+                    slot.progress();
 
                     if rx_interupt.try_recv().is_ok() {
                         buffer.unmap();
@@ -357,6 +481,7 @@ impl Reader {
                         }
                     }
 
+                    slot.progress();
                     nonces_processed += bytes_read as u64 / 64;
 
                     match &pb {
@@ -410,6 +535,18 @@ impl Reader {
                     }
                 }
             }
+        };
+
+        (tx_interupt, move || {
+            let caught = panic::catch_unwind(AssertUnwindSafe(body));
+            release_slot.release();
+            if caught.is_err() {
+                error!(
+                    "reader {}: panicked while scanning height={}, scoop={} -> drive gives up \
+                     this round, the miner carries on",
+                    drive_name, height, scoop
+                );
+            }
         })
     }
 }
@@ -437,4 +574,35 @@ pub fn check_overlap(drive_id_to_plots: &HashMap<String, Arc<Vec<Mutex<Plot>>>>)
         })
         .count()
         > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DriveSlot;
+
+    /// A drive is taken for a round, and the next round must not start a second
+    /// task on it: that task would block on the plot file the first one holds,
+    /// and the round could never close.
+    #[test]
+    fn a_busy_drive_is_not_started_twice() {
+        let slot = DriveSlot::new();
+        assert!(slot.try_start(1), "first round takes the drive");
+        assert!(!slot.try_start(2), "a second round must not");
+        slot.release();
+        assert!(slot.try_start(3), "and takes it again once the task left");
+    }
+
+    /// A stuck task is worth a line that says how long it has been silent.
+    #[test]
+    fn a_stuck_drive_reports_its_silence() {
+        let slot = DriveSlot::new();
+        assert!(slot.try_start(42));
+        let (busy_s, silent_s, height) = slot.stuck_for();
+        assert_eq!(height, 42);
+        assert!(busy_s < 5);
+        assert!(silent_s < 5);
+        slot.progress();
+        let (_, silent_after, _) = slot.stuck_for();
+        assert!(silent_after < 5, "progress resets the silence");
+    }
 }

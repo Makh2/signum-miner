@@ -95,7 +95,29 @@ Resilience - all of it from watching the miner go silent for hours:
   It is a string from outside, so it can be the wrong length or not hex at all,
   and it used to be a panic in the round setup - with `panic = 'abort'`, the end
   of the miner. A block with a refused signature is ignored, once per distinct
-  value.
+  value;
+* a drive is taken for a round and only gives itself back, so a round never starts
+  a second task on a drive whose previous task is still inside. That second task
+  used to block on the plot file forever, and the round it belonged to could never
+  close: one stuck drive was enough to stop every share until a restart. Now the
+  round scans without that drive and says which one, for how long it has been
+  busy, and how long since it last showed any progress;
+* the reader task itself runs under `catch_unwind`. This is not cosmetic: an
+  unexpected panic in a rayon task does not kill that thread, it aborts the whole
+  process (`Rayon: detected unexpected panic; aborting`, reproduced on purpose).
+  A panic now costs one round and one line.
+
+`useGpuMemMapping: false` is now the recommended setting, and the reason is in
+the log history: with mapping on, every reader thread calls into the driver
+itself - `map`/`unmap` around each 16 MB chunk, about 950 driver calls per round
+from five threads on one queue. After a round was preempted by a new block, all
+five threads were found stuck inside those calls: no disk I/O at all (0 MB/s, 0
+IOPS, 0% busy on all five drives, while reading the same files outside the miner
+took 70-450 ms), no line in the log, and nothing but a restart brought it back.
+With mapping off the reader threads make no OpenCL calls at all; the single GPU
+worker does the transfer. Measured: 13 rounds out of 13 closed, 18.6-21.8 s each,
+13 shares accepted, no watchdog line - against a wedge on the first or second
+round with mapping on.
 
 None of this is specific to the GPU build: the buffer timeout, the worker-gone
 lines, the watchdog and `catch_panic` are in the CPU-only build too, and it was
@@ -123,7 +145,10 @@ Deliberately **not** here:
 | `GPU worker: window at height=… failed 2 times in a row -> dropping it` | that window is lost; the round keeps going |
 | `GPU worker: giving up hashing after 5 failures in a row` | that worker stops hashing but still returns buffers, so rounds still close |
 | `GPU worker: still not hashing (N windows dropped since it gave up …)` | reminder every 50 windows that a worker is out until restart |
-| `round for height=… has not closed for 90s (N of 5 …)` | the watchdog closed a stuck round |
+| `round for height=… has not closed for 90s (N of 5 …, M buffer(s) free)` | the watchdog closed a stuck round; `0 free` points at the hashing side, `5 free` at the drives |
+| `reader G:\: still busy with height=… for …s (no progress for …s) -> scanning height=… without this drive` | that drive's previous task never came back; the round goes on without it |
+| `no drive could start height=…: all 5 drives are busy from earlier rounds` | every drive is stuck: a restart is the only cure, and now it says so at once |
+| `reader G:\: panicked while scanning height=… -> drive gives up this round` | an unexpected panic was caught in a reader task instead of aborting the process |
 
 Deadlines in the log are humanized by foxy-miner with
 `display = floor(ln(raw_seconds) * 43.79)`, so `00:06:10` is really about 1.3
@@ -166,6 +191,11 @@ From foxy-miner 2.7.0's sources (`lib/currentRoundManager.js`, `lib/proxy.js`):
 
 ## Still open
 
+* The hang itself is not repaired where it happens: the reader threads no longer
+  call the driver, so the trigger is gone, but a driver call that blocks forever
+  can still freeze the GPU worker. Then the drives give up one by one with a line
+  naming them, the round closes, and no share is produced until a restart - it is
+  visible, it is not fatal, and it is not fixed.
 * The root cause of the OpenCL failures is not fixed, only survived: `ocl.rs`
   still unwraps every call, and a window's failure is now recoverable (one retry,
   then the window is dropped) only because the profile unwinds. The next step, if
@@ -175,4 +205,5 @@ From foxy-miner 2.7.0's sources (`lib/currentRoundManager.js`, `lib/proxy.js`):
   under `panic = 'abort'` there is nothing to recover. The two startup-only
   `unwrap()`s in `miner.rs` and `reader.rs` are still plain.
 * No test covers the watchdog or the buffer timeout; both are pure enough to
-  extract and test if that ever bites.
+  extract and test if that ever bites. The drive slot has two tests, because
+  losing a drive silently is what cost the most so far.

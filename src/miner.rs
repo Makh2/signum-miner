@@ -668,13 +668,38 @@ impl Miner {
                                         // round: there would be nothing to scan
                                         // for.
                                         if state.update_mining_info(&mining_info) {
-                                            lock(&reader).start_reading(
+                                            let skipped = lock(&reader).start_reading(
                                                 mining_info.height,
                                                 state.block,
                                                 mining_info.base_target,
                                                 state.scoop,
                                                 &Arc::new(state.generation_signature_bytes),
                                             );
+                                            // A drive whose previous task never came
+                                            // back cannot report this round, so it is
+                                            // counted as reported here. Otherwise the
+                                            // round waits for an answer that will never
+                                            // arrive, and the miner goes quiet with it.
+                                            state.processed_reader_tasks += skipped;
+                                            if skipped >= reader_task_count {
+                                                error!(
+                                                    "{: <80}",
+                                                    format!(
+                                                        "no drive could start height={}: all {} \
+                                                         drives are busy from earlier rounds",
+                                                        mining_info.height, reader_task_count
+                                                    )
+                                                );
+                                                let _ = tx_nonce_data.try_send(NonceData {
+                                                    height: mining_info.height,
+                                                    block: state.block,
+                                                    base_target: mining_info.base_target,
+                                                    deadline: u64::MAX,
+                                                    nonce: 0,
+                                                    reader_task_processed: true,
+                                                    account_id: 0,
+                                                });
+                                            }
                                         }
                                         drop(state);
                                     } else if state.height > 0
@@ -688,13 +713,16 @@ impl Miner {
                                         // say why - silence was the only symptom before.
                                         if !state.stalled_warned {
                                             state.stalled_warned = true;
+                                            let free = lock(&reader).free_buffers();
                                             error!(
                                                 "round for height={} has not closed for {}s ({} of {} \
-                                                 reader tasks reported) -> closing it and carrying on",
+                                                 reader tasks reported, {} buffer(s) free) -> closing it \
+                                                 and carrying on",
                                                 state.height,
                                                 state.round_sw.elapsed_ms() / 1000,
                                                 state.processed_reader_tasks,
-                                                reader_task_count
+                                                reader_task_count,
+                                                free
                                             );
                                         }
                                         let (height, block, base_target) =
@@ -816,7 +844,7 @@ impl Miner {
 
                             if nonce_data.reader_task_processed {
                                 state.processed_reader_tasks += 1;
-                                if state.processed_reader_tasks == reader_task_count {
+                                if state.processed_reader_tasks >= reader_task_count {
                                     info!(
                                         "{: <80}",
                                         format!(
