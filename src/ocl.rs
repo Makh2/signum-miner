@@ -5,6 +5,7 @@ use ocl_core as core;
 
 use crate::config::Cfg;
 use crate::miner::{AlignedBuffer, Buffer};
+use crate::utils::lock;
 use std::cmp::{max, min};
 use std::ffi::CString;
 use std::process;
@@ -410,7 +411,7 @@ impl Buffer for GpuBuffer {
             // Expose exactly the mapping we just obtained: it is the memory the
             // reader has to write into, and any previous mapping is invalid.
             unsafe {
-                self.data.lock().unwrap().set_raw(ptr, size);
+                lock(&self.data).set_raw(ptr, size);
             }
             self.buffer_ptr_host = Some(map);
         }
@@ -432,7 +433,7 @@ impl Buffer for GpuBuffer {
         // The host mapping goes away: nothing may read or write through the
         // view until `get_buffer_for_writing` obtains a fresh mapping.
         unsafe {
-            self.data.lock().unwrap().set_raw(std::ptr::null_mut(), 0);
+            lock(&self.data).set_raw(std::ptr::null_mut(), 0);
         }
 
         if let Some(map) = self.buffer_ptr_host.take() {
@@ -477,7 +478,7 @@ fn upload_gensig(gpu_context: &Arc<GpuContext>, gensig: [u8; 32], blocking: bool
 
 fn transfer_buffer_to_gpu(gpu_context: &Arc<GpuContext>, buffer: &GpuBuffer, blocking: bool) {
     let data = buffer.data.clone();
-    let data2 = (*data).lock().unwrap();
+    let data2 = lock(&*data);
     if gpu_context.mapping {
         // The reader held the mapping while filling the buffer; unmapping here
         // publishes its contents to the device. If the reader already released

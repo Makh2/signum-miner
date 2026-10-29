@@ -2,7 +2,7 @@ use crate::miner::Buffer;
 #[cfg(feature = "opencl")]
 use crate::miner::CpuBuffer;
 use crate::plot::{Meta, Plot};
-use crate::utils::new_thread_pool;
+use crate::utils::{lock, new_thread_pool};
 use crossbeam_channel;
 use crossbeam_channel::{Receiver, Sender};
 use pbr::{ProgressBar, Units};
@@ -101,25 +101,34 @@ impl Reader {
         pb.message("Searching your hashes: ");
         let pb = Arc::new(Mutex::new(pb));
 
-        // send start signals (dummy buffer) to gpu threads
+        // send start signals (dummy buffer) to gpu threads. A worker that is
+        // gone must not panic this caller: it runs on the round's critical path,
+        // holding the round state and the reader, and a panic here would poison
+        // both locks and stop the miner.
         #[cfg(feature = "opencl")]
         for i in 0..self.tx_read_replies_gpu.as_ref().unwrap().len() {
-            self.tx_read_replies_gpu.as_ref().unwrap()[i]
-                .send(ReadReply {
-                    buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
-                    info: BufferInfo {
-                        len: 1,
-                        height,
-                        block,
-                        base_target,
-                        gensig: gensig.clone(),
-                        start_nonce: 0,
-                        finished: false,
-                        account_id: 0,
-                        gpu_signal: 1,
-                    },
-                })
-                .expect("Error sending 'round start' signal to GPU");
+            let sent = self.tx_read_replies_gpu.as_ref().unwrap()[i].send(ReadReply {
+                buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
+                info: BufferInfo {
+                    len: 1,
+                    height,
+                    block,
+                    base_target,
+                    gensig: gensig.clone(),
+                    start_nonce: 0,
+                    finished: false,
+                    account_id: 0,
+                    gpu_signal: 1,
+                },
+            });
+            if sent.is_err() {
+                error!(
+                    "reader: GPU worker {} is gone, the round for height={} will get no \
+                     hashes from it",
+                    i + 1,
+                    height
+                );
+            }
         }
 
         self.interupts = self
@@ -162,7 +171,7 @@ impl Reader {
         for plots in self.drive_id_to_plots.values() {
             let plots = plots.clone();
             self.pool.spawn(move || {
-                let mut p = plots[0].lock().unwrap();
+                let mut p = lock(&plots[0]);
 
                 if let Err(e) = p.seek_random() {
                     error!(
@@ -200,7 +209,7 @@ impl Reader {
             let mut waited_ms = 0u64;
             let plot_count = plots.len();
             'outer: for (i_p, p) in plots.iter().enumerate() {
-                let mut p = p.lock().unwrap();
+                let mut p = lock(p);
                 if let Err(e) = p.prepare(scoop) {
                     error!(
                         "reader: error preparing {} for reading: {} -> skip one round",
@@ -244,7 +253,7 @@ impl Reader {
                         sw.restart();
                     }
                     let mut_bs = buffer.get_buffer_for_writing();
-                    let mut bs = mut_bs.lock().unwrap();
+                    let mut bs = lock(&mut_bs);
                     let (bytes_read, start_nonce, next_plot) = match p.read(&mut bs, scoop) {
                         Ok(x) => x,
                         Err(e) => {
@@ -352,7 +361,7 @@ impl Reader {
 
                     match &pb {
                         Some(pb) => {
-                            let mut pb = pb.lock().unwrap();
+                            let mut pb = lock(pb);
                             pb.add(bytes_read as u64);
                         }
                         None => (),

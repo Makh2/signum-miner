@@ -1,5 +1,18 @@
 use core_affinity;
 use rayon;
+use std::sync::{Mutex, MutexGuard};
+
+/// Lock a mutex even if a thread panicked while holding it.
+///
+/// These locks guard plain data - a height, a buffer, a progress bar - and a
+/// poisoned mutex must not stop the miner. With `lock().unwrap()` one panic
+/// takes down every later user of that lock as well, and the farm stops until
+/// someone notices; worse, the hot locks (a buffer, the round state) are shared
+/// by every reader task, so one poisoned lock is a whole miner. The data may be
+/// a little stale after such a panic, which is a much better outcome.
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub fn new_thread_pool(num_threads: usize, thread_pinning: bool) -> rayon::ThreadPool {
     let core_ids = if thread_pinning {
