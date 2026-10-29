@@ -11,9 +11,14 @@ use crate::ocl::GpuContext;
 use crate::plot::{Plot, SCOOP_SIZE};
 use crate::poc_hashing;
 use crate::reader::Reader;
+#[cfg(feature = "opencl")]
+use crate::reader::GpuWorkers;
+#[cfg(feature = "opencl")]
+use crate::reader::{GPU_FAILURES_IN_A_ROW, GPU_REBUILD_BACKOFF_MS, GPU_SILENT_MS};
 use crate::requests::RequestHandler;
 use crate::utils::{catch_panic, get_device_id, lock, new_thread_pool};
 use crossbeam_channel;
+use crossbeam_channel::Sender;
 use filetime::FileTime;
 use futures_util::{stream::StreamExt, FutureExt};
 use tokio::sync::mpsc;
@@ -30,6 +35,8 @@ use std::path::PathBuf;
 use std::process;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "opencl")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::u64;
 use stopwatch::Stopwatch;
@@ -56,6 +63,10 @@ pub struct Miner {
     executor: Handle,
     wakeup_after: i64,
     submit_only_best: bool,
+    /// The running GPU workers and the way to replace one that stopped
+    /// answering. `None` when this build has no OpenCL or no GPU worker runs.
+    #[cfg(feature = "opencl")]
+    gpu_farm: Option<Arc<GpuFarm>>,
 }
 
 pub struct State {
@@ -295,6 +306,11 @@ pub trait Buffer {
     fn get_gpu_data(&self) -> Option<Mem>;
     fn unmap(&mut self);
     fn get_id(&self) -> usize;
+    /// Which GPU worker generation this buffer belongs to; zero for buffers that
+    /// are not tied to a device context.
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 
 pub struct CpuBuffer {
@@ -391,6 +407,155 @@ fn scan_plots(
     (drive_id_to_plots, global_capacity * 64)
 }
 
+/// Everything needed to build the GPU workers, kept so a worker that stopped
+/// answering can be built again without restarting the miner.
+#[cfg(feature = "opencl")]
+struct GpuCfg {
+    benchmark: bool,
+    platform: usize,
+    device: usize,
+    nonces_per_cache: usize,
+    mapping: bool,
+    /// How many buffers each worker should own; index is the worker's.
+    buffers_per_worker: Vec<usize>,
+}
+
+/// The GPU side of the miner: the workers that are running, and the way to
+/// replace them.
+#[cfg(feature = "opencl")]
+struct GpuFarm {
+    cfg: GpuCfg,
+    workers: Arc<GpuWorkers>,
+    tx_empty_buffers: Sender<Box<dyn Buffer + Send>>,
+    tx_nonce_data: mpsc::Sender<NonceData>,
+    /// Only one rebuild at a time. A driver call that never returns would
+    /// otherwise leave a new rebuild thread behind every time the stall check
+    /// looks at the farm.
+    rebuilding: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "opencl")]
+impl GpuFarm {
+    /// Replaces the workers on a thread of their own.
+    ///
+    /// The old worker is stuck inside a driver call that may never return, and
+    /// building a new context talks to the same driver: if that call blocks too,
+    /// it must not block the task that starts rounds - that is how the miner
+    /// went silent for hours in the first place.
+    fn rebuild(&self, reason: &str) {
+        if self.rebuilding.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if self.workers.since_rebuild_ms() < GPU_REBUILD_BACKOFF_MS {
+            self.rebuilding.store(false, Ordering::SeqCst);
+            return;
+        }
+        error!(
+            "GPU worker: {} -> building a new one in the background (generation {}); the drives \
+             keep scanning, chunks already handed to the old worker are dropped",
+            reason,
+            self.workers.generation()
+        );
+
+        let cfg = GpuCfg {
+            benchmark: self.cfg.benchmark,
+            platform: self.cfg.platform,
+            device: self.cfg.device,
+            nonces_per_cache: self.cfg.nonces_per_cache,
+            mapping: self.cfg.mapping,
+            buffers_per_worker: self.cfg.buffers_per_worker.clone(),
+        };
+        let workers = self.workers.clone();
+        let tx_empty_buffers = self.tx_empty_buffers.clone();
+        let tx_nonce_data = self.tx_nonce_data.clone();
+        let rebuilding = self.rebuilding.clone();
+
+        thread::spawn(move || {
+            let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                spawn_gpu_workers(&cfg, &workers, &tx_empty_buffers, &tx_nonce_data);
+            }));
+            rebuilding.store(false, Ordering::SeqCst);
+            match built {
+                Ok(()) => error!(
+                    "GPU worker: generation {} is running; the round carries on with it",
+                    workers.generation()
+                ),
+                Err(_) => error!(
+                    "GPU worker: rebuilding failed - the device or its driver is in trouble; \
+                     rounds still close but no shares are hashed until the next attempt"
+                ),
+            }
+        });
+    }
+}
+
+/// Builds the GPU workers, their buffers and their channels, and puts them in
+/// place. Used at startup and again whenever a worker has to be replaced.
+#[cfg(feature = "opencl")]
+fn spawn_gpu_workers(
+    cfg: &GpuCfg,
+    workers: &Arc<GpuWorkers>,
+    tx_empty_buffers: &Sender<Box<dyn Buffer + Send>>,
+    tx_nonce_data: &mpsc::Sender<NonceData>,
+) {
+    let mut txs = Vec::with_capacity(cfg.buffers_per_worker.len());
+    let mut rxs = Vec::with_capacity(cfg.buffers_per_worker.len());
+    for _ in 0..cfg.buffers_per_worker.len() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        txs.push(tx);
+        rxs.push(rx);
+    }
+
+    // A fresh context per worker: a wedged one is exactly what is being replaced.
+    let contexts: Vec<Arc<GpuContext>> = (0..cfg.buffers_per_worker.len())
+        .map(|_| {
+            Arc::new(GpuContext::new(
+                cfg.platform,
+                cfg.device,
+                cfg.nonces_per_cache,
+                cfg.mapping,
+            ))
+        })
+        .collect();
+
+    workers.install(txs);
+    let generation = workers.generation();
+
+    // The buffers are allocated in the context of the worker that will use
+    // them, and carry its generation so a buffer left over from a replaced
+    // worker is retired by the reader instead of being filled for a worker that
+    // cannot use it.
+    for (i, context) in contexts.iter().enumerate() {
+        for _ in 0..cfg.buffers_per_worker[i] {
+            let gpu_buffer = GpuBuffer::new(context, i + 1, generation);
+            if tx_empty_buffers
+                .try_send(Box::new(gpu_buffer) as Box<dyn Buffer + Send>)
+                .is_err()
+            {
+                warn!(
+                    "GPU worker: buffer pool is full, not adding another buffer for worker {}",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    for context in contexts.into_iter() {
+        let gpu_workers = workers.clone();
+        let rx = rxs.remove(0);
+        let tx_empty_buffers = tx_empty_buffers.clone();
+        let tx_nonce_data = tx_nonce_data.clone();
+        thread::spawn(create_gpu_worker_task(
+            cfg.benchmark,
+            rx,
+            tx_empty_buffers,
+            tx_nonce_data,
+            context,
+            gpu_workers,
+        ));
+    }
+}
+
 impl Miner {
     pub fn new(cfg: Cfg, executor: Handle) -> Miner {
         let (drive_id_to_plots, total_size) =
@@ -484,60 +649,23 @@ impl Miner {
         #[cfg(feature = "opencl")]
         let buffer_count = cpu_buffer_count + gpu_buffer_count;
         let buffer_size_cpu = cfg.cpu_nonces_per_cache * SCOOP_SIZE as usize;
-        let (tx_empty_buffers, rx_empty_buffers) =
-            crossbeam_channel::bounded(buffer_count as usize);
+        // The pool is one generation of buffers larger than the number of
+        // buffers, so the buffers of a rebuilt GPU worker always fit next to the
+        // ones the old worker is still holding. The surplus is retired by the
+        // readers as they come across it.
+        #[cfg(feature = "opencl")]
+        let pool_capacity = buffer_count as usize + gpu_buffer_count;
+        #[cfg(not(feature = "opencl"))]
+        let pool_capacity = buffer_count as usize;
+        let (tx_empty_buffers, rx_empty_buffers) = crossbeam_channel::bounded(pool_capacity);
         let (tx_read_replies_cpu, rx_read_replies_cpu) =
             crossbeam_channel::bounded(cpu_buffer_count);
-
-        #[cfg(feature = "opencl")]
-        let mut tx_read_replies_gpu = Vec::new();
-        #[cfg(feature = "opencl")]
-        let mut rx_read_replies_gpu = Vec::new();
-        #[cfg(feature = "opencl")]
-        let mut gpu_contexts = Vec::new();
-        #[cfg(feature = "opencl")]
-        {
-            for _ in 0..gpu_threads {
-                let (tx, rx) = crossbeam_channel::unbounded();
-                tx_read_replies_gpu.push(tx);
-                rx_read_replies_gpu.push(rx);
-            }
-
-            for _ in 0..gpu_threads {
-                gpu_contexts.push(Arc::new(GpuContext::new(
-                    cfg.gpu_platform,
-                    cfg.gpu_device,
-                    cfg.gpu_nonces_per_cache,
-                    if cfg.benchmark_io() {
-                        false
-                    } else {
-                        cfg.gpu_mem_mapping
-                    },
-                )));
-            }
-        }
 
         for _ in 0..cpu_buffer_count {
             let cpu_buffer = CpuBuffer::new(buffer_size_cpu);
             tx_empty_buffers
                 .send(Box::new(cpu_buffer) as Box<dyn Buffer + Send>)
                 .unwrap();
-        }
-
-        #[cfg(feature = "opencl")]
-        for (i, context) in gpu_contexts.iter().enumerate() {
-            for _ in 0..(gpu_buffer_count / gpu_threads
-                + if i == 0 {
-                    gpu_buffer_count % gpu_threads
-                } else {
-                    0
-                })
-            {
-                let gpu_buffer = GpuBuffer::new(&context.clone(), i + 1);
-                tx_empty_buffers
-                    .send(Box::new(gpu_buffer) as Box<dyn Buffer + Send>)
-                    .unwrap();
-            }
         }
 
         let (tx_nonce_data, rx_nonce_data) = mpsc::channel(buffer_count);
@@ -561,21 +689,51 @@ impl Miner {
             );
         }
 
+        // The GPU side is built by the same function that rebuilds it later, so a
+        // worker that had to be replaced is built exactly like these are.
         #[cfg(feature = "opencl")]
-        for i in 0..gpu_threads {
-            thread::spawn({
-                create_gpu_worker_task(
-                    cfg.benchmark_io(),
-                    rx_read_replies_gpu[i].clone(),
-                    tx_empty_buffers.clone(),
-                    tx_nonce_data.clone(),
-                    gpu_contexts[i].clone(),
-                )
-            });
-        }
+        let gpu_farm = if gpu_threads > 0 {
+            let workers = GpuWorkers::new(Vec::new());
+            let farm = GpuFarm {
+                cfg: GpuCfg {
+                    benchmark: cfg.benchmark_io(),
+                    platform: cfg.gpu_platform,
+                    device: cfg.gpu_device,
+                    nonces_per_cache: cfg.gpu_nonces_per_cache,
+                    mapping: if cfg.benchmark_io() {
+                        false
+                    } else {
+                        cfg.gpu_mem_mapping
+                    },
+                    buffers_per_worker: (0..gpu_threads)
+                        .map(|i| {
+                            gpu_buffer_count / gpu_threads
+                                + if i == 0 {
+                                    gpu_buffer_count % gpu_threads
+                                } else {
+                                    0
+                                }
+                        })
+                        .collect(),
+                },
+                workers: workers.clone(),
+                tx_empty_buffers: tx_empty_buffers.clone(),
+                tx_nonce_data: tx_nonce_data.clone(),
+                rebuilding: Arc::new(AtomicBool::new(false)),
+            };
+            spawn_gpu_workers(
+                &farm.cfg,
+                &farm.workers,
+                &farm.tx_empty_buffers,
+                &farm.tx_nonce_data,
+            );
+            Some(Arc::new(farm))
+        } else {
+            None
+        };
 
         #[cfg(feature = "opencl")]
-        let tx_read_replies_gpu = Some(tx_read_replies_gpu);
+        let tx_read_replies_gpu = gpu_farm.as_ref().map(|farm| farm.workers.clone());
         #[cfg(not(feature = "opencl"))]
         let tx_read_replies_gpu = None;
 
@@ -596,6 +754,8 @@ impl Miner {
                 cfg.cpu_thread_pinning,
                 cfg.benchmark_cpu(),
             ),
+            #[cfg(feature = "opencl")]
+            gpu_farm,
             rx_nonce_data,
             tx_nonce_data: tx_nonce_data.clone(),
             target_deadline: cfg.target_deadline,
@@ -634,6 +794,8 @@ impl Miner {
         let wakeup_after = self.wakeup_after;
         let tx_nonce_data = self.tx_nonce_data.clone();
         let reader_task_count = self.reader_task_count;
+        #[cfg(feature = "opencl")]
+        let gpu_farm = self.gpu_farm.clone();
         tokio::spawn(async move {
             info!("→ Interval task started");
             Interval::new_interval(Duration::from_millis(get_mining_info_interval))
@@ -642,6 +804,8 @@ impl Miner {
                     let reader = reader.clone();
                     let request_handler = request_handler.clone();
                     let tx_nonce_data = tx_nonce_data.clone();
+                    #[cfg(feature = "opencl")]
+                    let gpu_farm = gpu_farm.clone();
                     async move {
                         // The pool side can go wrong in more ways than a
                         // returned error: building the request parses headers,
@@ -773,6 +937,34 @@ impl Miner {
                                     state.outage = true;
                                 }
                         });
+
+                        // A GPU worker that stopped answering cannot be talked
+                        // to again: the driver call it sits in may never return.
+                        // Build a new one instead - on its own thread, so a
+                        // driver that blocks the rebuild too cannot block this
+                        // task, which is the only one that starts rounds.
+                        #[cfg(feature = "opencl")]
+                        if let Some(gpu) = gpu_farm.as_ref() {
+                            let scanning = lock(&state).scanning;
+                            if scanning {
+                                let free = lock(&reader).free_buffers();
+                                let failures = gpu.workers.failures_in_a_row();
+                                let silent = gpu.workers.silent_for_ms();
+                                let reason = if failures >= GPU_FAILURES_IN_A_ROW {
+                                    Some(format!("{} windows in a row failed", failures))
+                                } else if silent > GPU_SILENT_MS && free == 0 {
+                                    Some(format!(
+                                        "no window hashed for {}s and not one buffer came back",
+                                        silent / 1000
+                                    ))
+                                } else {
+                                    None
+                                };
+                                if let Some(reason) = reason {
+                                    gpu.rebuild(&reason);
+                                }
+                            }
+                        }
                     }
                 })
                 .await; 
@@ -845,15 +1037,26 @@ impl Miner {
                             if nonce_data.reader_task_processed {
                                 state.processed_reader_tasks += 1;
                                 if state.processed_reader_tasks >= reader_task_count {
-                                    info!(
-                                        "{: <80}",
+                                    let elapsed = state.sw.elapsed_ms();
+                                    // A round that closed without a single scan
+                                    // has no speed worth printing; the line above
+                                    // already says why it closed.
+                                    let speed = if elapsed > 0 {
                                         format!(
-                                            "round finished: roundtime={}ms, speed={:.2}MiB/s",
-                                            state.sw.elapsed_ms(),
+                                            "{:.2}MiB/s",
                                             total_size as f64 * 1000.0
                                                 / 1024.0
                                                 / 1024.0
-                                                / state.sw.elapsed_ms() as f64
+                                                / elapsed as f64
+                                        )
+                                    } else {
+                                        "nothing was scanned".to_string()
+                                    };
+                                    info!(
+                                        "{: <80}",
+                                        format!(
+                                            "round finished: roundtime={}ms, speed={}",
+                                            elapsed, speed
                                         )
                                     );
 

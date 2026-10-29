@@ -105,7 +105,26 @@ Resilience - all of it from watching the miner go silent for hours:
 * the reader task itself runs under `catch_unwind`. This is not cosmetic: an
   unexpected panic in a rayon task does not kill that thread, it aborts the whole
   process (`Rayon: detected unexpected panic; aborting`, reproduced on purpose).
-  A panic now costs one round and one line.
+  A panic now costs one round and one line;
+* a new round lets the interrupted one leave first - up to 1.5 s - before it calls
+  a drive stuck. Without that, a block arriving mid-round found all five drives
+  still inside the previous round, skipped every one of them and closed the new
+  round at `roundtime=0ms`: the block was scanned by nobody. Measured in the live
+  log at 13:26:51, and the reason the wait exists;
+* the hashing path of `ocl.rs` returns `Result<_, GpuError>` instead of unwrapping
+  every driver call: `gpu_transfer`, `upload_gensig`, `transfer_buffer_to_gpu`,
+  `gpu_hash`, `hash` and `get_result` all say which call failed and what the
+  driver answered. A failed window is a value, not a panic, so it is retried once
+  and then dropped - and a driver that keeps failing no longer turns into an
+  aborted process;
+* the GPU worker is rebuilt instead of given up on. A worker that has failed five
+  windows in a row, or has hashed nothing for 60 s while not one buffer came back,
+  is replaced by a new one - new contexts, new queues, new buffers - on a thread of
+  its own, because the driver call the old worker sits in may block the rebuild
+  too and that must not reach the task that starts rounds. The buffers of the old
+  generation are retired by the readers instead of being filled for a worker that
+  cannot use them (a buffer belongs to its context, and the driver refuses one
+  from another). The pool is made one generation larger for exactly that.
 
 `useGpuMemMapping: false` is now the recommended setting, and the reason is in
 the log history: with mapping on, every reader thread calls into the driver
@@ -134,17 +153,20 @@ Deliberately **not** here:
 | line | meaning |
 |---|---|
 | `Starting scan of new block: height=…, scoop=… (chain)` | foxy handed the miner a round |
-| `round finished: roundtime=…ms, speed=…` | the scan completed and the best share (if any) was submitted |
+| `round finished: roundtime=…ms, speed=…` | the scan completed and the best share (if any) was submitted; `speed=nothing was scanned` means it closed with no drive able to start |
 | `accepted: height=…, deadline=…` | the pool took the share |
 | `refused: height=…, deadline=…: <pool text>` | the pool's answer; costs nothing |
 | `miner: … panicked -> carrying on` | a panic was caught in a long-lived task; nothing else changed |
 | `pool sent a generationSignature that is not 32 bytes of hex: "…"` | that block is ignored; the pool's string is not to be trusted |
 | `reader …: no free buffer for 60s while scanning height=…` | the hashing side stopped returning buffers |
 | `reader …: GPU worker N is gone` | that worker thread died; buffers are still returned |
-| `GPU worker: hashing failed at height=… -> trying it again (attempt 1 of 2)` | an OpenCL call panicked once; the window gets a second try |
-| `GPU worker: window at height=… failed 2 times in a row -> dropping it` | that window is lost; the round keeps going |
-| `GPU worker: giving up hashing after 5 failures in a row` | that worker stops hashing but still returns buffers, so rounds still close |
-| `GPU worker: still not hashing (N windows dropped since it gave up …)` | reminder every 50 windows that a worker is out until restart |
+| `GPU worker: hashing failed at height=… (set_kernel_arg(kernel2, 2) failed: …) -> trying it again (attempt 1 of 2)` | a driver call returned an error; the window gets a second try |
+| `GPU worker: window at height=… failed 2 times in a row (…) -> dropping it` | that window is lost; the round keeps going |
+| `GPU worker: giving up hashing after 5 failures in a row` | that worker stops hashing but still returns buffers, so rounds still close - and the miner rebuilds it |
+| `GPU worker: still not hashing (N windows dropped since it gave up …)` | reminder every 50 windows while a rebuild has not happened yet |
+| `GPU worker: … -> building a new one in the background (generation N)` | the old worker is being replaced; the drives keep scanning |
+| `GPU worker: generation N is running; the round carries on with it` | the new worker is in place and hashing |
+| `GPU worker: rebuilding failed - the device or its driver is in trouble` | the new context could not be built either; rounds still close, nothing is hashed |
 | `round for height=… has not closed for 90s (N of 5 …, M buffer(s) free)` | the watchdog closed a stuck round; `0 free` points at the hashing side, `5 free` at the drives |
 | `reader G:\: still busy with height=… for …s (no progress for …s) -> scanning height=… without this drive` | that drive's previous task never came back; the round goes on without it |
 | `no drive could start height=…: all 5 drives are busy from earlier rounds` | every drive is stuck: a restart is the only cure, and now it says so at once |
@@ -191,19 +213,21 @@ From foxy-miner 2.7.0's sources (`lib/currentRoundManager.js`, `lib/proxy.js`):
 
 ## Still open
 
-* The hang itself is not repaired where it happens: the reader threads no longer
-  call the driver, so the trigger is gone, but a driver call that blocks forever
-  can still freeze the GPU worker. Then the drives give up one by one with a line
-  naming them, the round closes, and no share is produced until a restart - it is
-  visible, it is not fatal, and it is not fixed.
-* The root cause of the OpenCL failures is not fixed, only survived: `ocl.rs`
-  still unwraps every call, and a window's failure is now recoverable (one retry,
-  then the window is dropped) only because the profile unwinds. The next step, if
-  the log shows failures, is to make the OpenCL calls return `Result` instead of
-  panicking, and rebuild the GPU context when the device itself is in trouble.
+* The hang itself is not repaired where it happens. `ocl.rs` reports failed calls
+  now, and a worker that stops answering is rebuilt, but a driver call that never
+  returns still costs the window it was in and the worker for as long as the
+  rebuild takes. What is fixed is the silence: the drives name themselves, the
+  round closes, the log says a new worker is being built, and mining resumes
+  without a restart.
+* A rebuild can fail the same way - building a context talks to the same driver
+  that is stuck. That is why it runs on its own thread, behind a backoff and a
+  "one rebuild at a time" flag: if it blocks, the miner keeps starting rounds and
+  the log says no new worker appeared. The rebuild itself has not been tested
+  against a real wedge, only against the failure paths.
+* The startup path still unwraps: building the first context, the program and the
+  buffers. A machine that cannot create them has nothing to mine with, so it exits
+  with the driver's message - that is intended, but it is a plain panic.
 * Mutex poisoning, and with it `utils::lock`, only exists because panics unwind -
-  under `panic = 'abort'` there is nothing to recover. The two startup-only
-  `unwrap()`s in `miner.rs` and `reader.rs` are still plain.
-* No test covers the watchdog or the buffer timeout; both are pure enough to
-  extract and test if that ever bites. The drive slot has two tests, because
-  losing a drive silently is what cost the most so far.
+  under `panic = 'abort'` there is nothing to recover.
+* No test covers the watchdog, the preemption grace or the rebuild; the drive slot
+  has two tests, because losing a drive silently is what cost the most so far.

@@ -23,6 +23,30 @@ const BUFFER_WAIT_MS: u64 = 500;
 /// waiting for it forever used to hang the round for good.
 const BUFFER_GIVE_UP_MS: u64 = 60_000;
 
+/// How long a new round waits for the previous round's tasks to leave before it
+/// judges their drives stuck.
+///
+/// A new block interrupts the round that is running, and its tasks leave on the
+/// next chunk they read - a fraction of a second, but not instantly. Starting
+/// the new round at once found every drive still busy, skipped the whole round
+/// and closed it at zero milliseconds: the block was then scanned by nobody.
+const PREEMPT_GRACE_MS: u64 = 1_500;
+
+/// How long a GPU worker may stay silent before the miner builds a new one.
+/// A window takes a second or two, so a minute of silence is not slowness.
+#[cfg(feature = "opencl")]
+pub const GPU_SILENT_MS: u64 = 60_000;
+
+/// How many windows in a row may fail before the worker is replaced instead of
+/// waiting for it to give up on its own.
+#[cfg(feature = "opencl")]
+pub const GPU_FAILURES_IN_A_ROW: u64 = 5;
+
+/// How long to wait after a rebuild before trying another one, so a device that
+/// is failing hard does not get a new context every second.
+#[cfg(feature = "opencl")]
+pub const GPU_REBUILD_BACKOFF_MS: u64 = 20_000;
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -84,6 +108,10 @@ impl DriveSlot {
         self.busy.store(false, Ordering::SeqCst);
     }
 
+    fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
     /// How long the previous task has been in this drive, and how long ago it
     /// last showed any progress.
     fn stuck_for(&self) -> (u64, u64, u64) {
@@ -93,6 +121,126 @@ impl DriveSlot {
             now.saturating_sub(self.progress_ms.load(Ordering::SeqCst)) / 1000,
             self.height.load(Ordering::SeqCst),
         )
+    }
+}
+
+/// The GPU worker that is running now.
+///
+/// Reads take the current sender from here for every chunk, so a worker that had
+/// to be replaced - because the device wedged, or kept failing - is used from the
+/// next chunk on without touching the reader tasks. The counters are what the
+/// stall check in the miner looks at.
+#[allow(dead_code)]
+pub struct GpuWorkers {
+    txs: Mutex<Vec<Sender<ReadReply>>>,
+    /// When the running worker last finished (or failed) a window.
+    last_window_ms: AtomicU64,
+    windows: AtomicU64,
+    failures_in_a_row: AtomicU64,
+    generation: AtomicU64,
+    last_rebuild_ms: AtomicU64,
+}
+
+#[allow(dead_code)]
+impl GpuWorkers {
+    pub fn new(txs: Vec<Sender<ReadReply>>) -> Arc<Self> {
+        Arc::new(Self {
+            txs: Mutex::new(txs),
+            last_window_ms: AtomicU64::new(0),
+            windows: AtomicU64::new(0),
+            failures_in_a_row: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            last_rebuild_ms: AtomicU64::new(0),
+        })
+    }
+
+    /// Hands a chunk to the worker that is running now. On `Err` the caller gets
+    /// its reply - and the buffer in it - back.
+    pub fn send(&self, index: usize, reply: ReadReply) -> Result<(), ReadReply> {
+        let tx = match lock(&self.txs).get(index) {
+            Some(tx) => tx.clone(),
+            None => return Err(reply),
+        };
+        tx.send(reply).map_err(|err| err.0)
+    }
+
+    pub fn count(&self) -> usize {
+        lock(&self.txs).len()
+    }
+
+    /// A window came back: hashed, or failed. Both are signs of a worker that is
+    /// still alive; only silence is not.
+    pub fn note_window(&self, hashed: bool) {
+        self.last_window_ms.store(now_ms(), Ordering::SeqCst);
+        if hashed {
+            self.windows.fetch_add(1, Ordering::SeqCst);
+            self.failures_in_a_row.store(0, Ordering::SeqCst);
+        } else {
+            self.failures_in_a_row.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub fn failures_in_a_row(&self) -> u64 {
+        self.failures_in_a_row.load(Ordering::SeqCst)
+    }
+
+    /// How long the running worker has been silent. Zero means it has not been
+    /// used yet in this process.
+    pub fn silent_for_ms(&self) -> u64 {
+        let last = self.last_window_ms.load(Ordering::SeqCst);
+        if last == 0 {
+            return 0;
+        }
+        now_ms().saturating_sub(last)
+    }
+
+    pub fn windows(&self) -> u64 {
+        self.windows.load(Ordering::SeqCst)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    pub fn last_rebuild_ms(&self) -> u64 {
+        self.last_rebuild_ms.load(Ordering::SeqCst)
+    }
+
+    /// How long since the running generation was installed; a rebuild is not
+    /// worth trying before the backoff has passed.
+    pub fn since_rebuild_ms(&self) -> u64 {
+        let last = self.last_rebuild_ms.load(Ordering::SeqCst);
+        if last == 0 {
+            return u64::MAX;
+        }
+        now_ms().saturating_sub(last)
+    }
+
+    /// Puts a freshly created set of workers in place. Reads pick the new
+    /// senders up on their next chunk; the old ones are abandoned with their
+    /// receiver, which is the only thing a wedged driver call leaves behind.
+    pub fn install(&self, txs: Vec<Sender<ReadReply>>) {
+        *lock(&self.txs) = txs;
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.last_rebuild_ms.store(now_ms(), Ordering::SeqCst);
+        self.last_window_ms.store(0, Ordering::SeqCst);
+        self.failures_in_a_row.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Hands a buffer back to the pool without ever blocking the caller.
+///
+/// The pool is bounded, and after a GPU worker was rebuilt there can be more
+/// buffers in circulation than the pool was made for: the abandoned worker may
+/// still be holding some, and the new one got its own. A blocking send would
+/// then wedge the reader task - and its pool thread - on a full channel, which
+/// is exactly the kind of silence this fork is trying to remove. A full pool
+/// means the buffers it dropped are surplus, so dropping them costs nothing.
+fn return_buffer(tx_empty_buffers: &Sender<Box<dyn Buffer + Send>>, buffer: Box<dyn Buffer + Send>) {
+    match tx_empty_buffers.try_send(buffer) {
+        Ok(()) => (),
+        Err(crossbeam_channel::TrySendError::Full(_)) => (),
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => (),
     }
 }
 
@@ -120,7 +268,7 @@ pub struct Reader {
     rx_empty_buffers: Receiver<Box<dyn Buffer + Send>>,
     tx_empty_buffers: Sender<Box<dyn Buffer + Send>>,
     tx_read_replies_cpu: Sender<ReadReply>,
-    tx_read_replies_gpu: Option<Vec<Sender<ReadReply>>>,
+    tx_read_replies_gpu: Option<Arc<GpuWorkers>>,
     interupts: Vec<Sender<()>>,
     /// One slot per drive, so a task that never returns can be named and the
     /// round can be scanned without that drive instead of never closing.
@@ -137,7 +285,7 @@ impl Reader {
         rx_empty_buffers: Receiver<Box<dyn Buffer + Send>>,
         tx_empty_buffers: Sender<Box<dyn Buffer + Send>>,
         tx_read_replies_cpu: Sender<ReadReply>,
-        tx_read_replies_gpu: Option<Vec<Sender<ReadReply>>>,
+        tx_read_replies_gpu: Option<Arc<GpuWorkers>>,
         show_progress: bool,
         show_drive_stats: bool,
         thread_pinning: bool,
@@ -185,6 +333,17 @@ impl Reader {
         for interupt in &self.interupts {
             interupt.send(()).ok();
         }
+
+        // Let the interrupted round's tasks leave before deciding a drive is
+        // stuck. They check for the interrupt after the chunk they are reading,
+        // so this usually takes tens of milliseconds; a drive that is still busy
+        // after the grace is the one worth naming and skipping.
+        let grace_until = now_ms() + PREEMPT_GRACE_MS;
+        while now_ms() < grace_until
+            && self.drive_slots.values().any(|slot| slot.is_busy())
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let mut pb = ProgressBar::new(self.total_size);
         pb.format("│██░│");
         pb.set_width(Some(80));
@@ -197,29 +356,37 @@ impl Reader {
         // holding the round state and the reader, and a panic here would poison
         // both locks and stop the miner.
         #[cfg(feature = "opencl")]
-        for i in 0..self.tx_read_replies_gpu.as_ref().unwrap().len() {
-            let sent = self.tx_read_replies_gpu.as_ref().unwrap()[i].send(ReadReply {
-                buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
-                info: BufferInfo {
-                    len: 1,
-                    height,
-                    block,
-                    base_target,
-                    gensig: gensig.clone(),
-                    start_nonce: 0,
-                    finished: false,
-                    account_id: 0,
-                    gpu_signal: 1,
-                },
-            });
-            if sent.is_err() {
-                error!(
-                    "reader: GPU worker {} is gone, the round for height={} will get no \
-                     hashes from it",
-                    i + 1,
-                    height
-                );
+        match self.tx_read_replies_gpu.as_ref() {
+            Some(workers) => {
+                for i in 0..workers.count() {
+                    let sent = workers.send(
+                        i,
+                        ReadReply {
+                            buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
+                            info: BufferInfo {
+                                len: 1,
+                                height,
+                                block,
+                                base_target,
+                                gensig: gensig.clone(),
+                                start_nonce: 0,
+                                finished: false,
+                                account_id: 0,
+                                gpu_signal: 1,
+                            },
+                        },
+                    );
+                    if sent.is_err() {
+                        error!(
+                            "reader: GPU worker {} is gone, the round for height={} will get no \
+                             hashes from it",
+                            i + 1,
+                            height
+                        );
+                    }
+                }
             }
+            None => (),
         }
 
         let mut interupts = Vec::new();
@@ -370,6 +537,28 @@ impl Reader {
                             continue;
                         }
                     };
+
+                    // A buffer made for a GPU worker that has since been
+                    // replaced belongs to a device context the new worker does
+                    // not use: every window filled with it would be refused by
+                    // the driver, and it would keep failing forever. Retire it
+                    // and wait for the next buffer instead.
+                    #[cfg(feature = "opencl")]
+                    if let Some(workers) = tx_read_replies_gpu.as_ref() {
+                        let generation = buffer.generation();
+                        if generation != 0 && generation != workers.generation() {
+                            debug!(
+                                "reader {}: retiring a buffer from GPU worker generation {} \
+                                 (now {})",
+                                drive,
+                                generation,
+                                workers.generation()
+                            );
+                            drop(buffer);
+                            continue 'inner;
+                        }
+                    }
+
                     waited_ms = 0;
                     slot.progress();
                     if show_drive_stats {
@@ -392,7 +581,7 @@ impl Reader {
 
                     if rx_interupt.try_recv().is_ok() {
                         buffer.unmap();
-                        let _ = tx_empty_buffers.send(buffer);
+                        return_buffer(&tx_empty_buffers, buffer);
                         break 'outer;
                     }
 
@@ -424,11 +613,35 @@ impl Reader {
                                      returning the buffer",
                                     drive, height, scoop
                                 );
-                                let _ = tx_empty_buffers.send(err.0.buffer);
+                                return_buffer(&tx_empty_buffers, err.0.buffer);
                                 break 'outer;
                             }
                         }
                         i => {
+                            // A chunk filled into a buffer from a replaced
+                            // worker belongs to a context the new worker does
+                            // not use, and the driver would refuse it: drop it
+                            // rather than spend a failed window on it. The last
+                            // chunk of a drive is sent anyway, so its "drive
+                            // finished" report is not lost with it.
+                            let stale = match tx_read_replies_gpu.as_ref() {
+                                Some(workers) => buffer.generation() != workers.generation(),
+                                None => false,
+                            };
+                            if stale && !finished {
+                                debug!(
+                                    "reader {}: dropping a chunk filled for GPU worker \
+                                     generation {} (now {})",
+                                    drive,
+                                    buffer.generation(),
+                                    tx_read_replies_gpu
+                                        .as_ref()
+                                        .map(|workers| workers.generation())
+                                        .unwrap_or(0)
+                                );
+                                drop(buffer);
+                                continue 'inner;
+                            }
                             let reply = ReadReply {
                                 buffer,
                                 info: BufferInfo {
@@ -443,13 +656,17 @@ impl Reader {
                                     gpu_signal: 0,
                                 },
                             };
-                            if let Err(err) = tx_read_replies_gpu.as_ref().unwrap()[i - 1].send(reply) {
+                            let sent = match tx_read_replies_gpu.as_ref() {
+                                Some(workers) => workers.send(i - 1, reply),
+                                None => Err(reply),
+                            };
+                            if let Err(err) = sent {
                                 error!(
                                     "reader {}: GPU worker {} is gone (height={}, scoop={}) -> \
                                      returning the buffer",
                                     drive, i, height, scoop
                                 );
-                                let _ = tx_empty_buffers.send(err.0.buffer);
+                                return_buffer(&tx_empty_buffers, err.buffer);
                                 break 'outer;
                             }
                         }
@@ -476,7 +693,7 @@ impl Reader {
                                  returning the buffer",
                                 drive, height, scoop
                             );
-                            let _ = tx_empty_buffers.send(err.0.buffer);
+                            return_buffer(&tx_empty_buffers, err.0.buffer);
                             break 'outer;
                         }
                     }
@@ -499,23 +716,28 @@ impl Reader {
                     // send termination signal (dummy buffer) to gpu
                     if finished {
                         #[cfg(feature = "opencl")]
-                        for i in 0..tx_read_replies_gpu.as_ref().unwrap().len() {
-                            // A signal for a worker that is gone is worth no more
-                            // than its buffer - never worth a panic here.
-                            let _ = tx_read_replies_gpu.as_ref().unwrap()[i].send(ReadReply {
-                                buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
-                                info: BufferInfo {
-                                    len: 1,
-                                    height,
-                                    block,
-                                    base_target,
-                                    gensig: gensig.clone(),
-                                    start_nonce: 0,
-                                    finished: false,
-                                    account_id: 0,
-                                    gpu_signal: 2,
-                                },
-                            });
+                        if let Some(workers) = tx_read_replies_gpu.as_ref() {
+                            for i in 0..workers.count() {
+                                // A signal for a worker that is gone is worth no
+                                // more than its buffer - never worth a panic here.
+                                let _ = workers.send(
+                                    i,
+                                    ReadReply {
+                                        buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
+                                        info: BufferInfo {
+                                            len: 1,
+                                            height,
+                                            block,
+                                            base_target,
+                                            gensig: gensig.clone(),
+                                            start_nonce: 0,
+                                            finished: false,
+                                            account_id: 0,
+                                            gpu_signal: 2,
+                                        },
+                                    },
+                                );
+                            }
                         }
                     }
 
@@ -579,6 +801,7 @@ pub fn check_overlap(drive_id_to_plots: &HashMap<String, Arc<Vec<Mutex<Plot>>>>)
 #[cfg(test)]
 mod tests {
     use super::DriveSlot;
+    use super::GpuWorkers;
 
     /// A drive is taken for a round, and the next round must not start a second
     /// task on it: that task would block on the plot file the first one holds,
@@ -604,5 +827,36 @@ mod tests {
         slot.progress();
         let (_, silent_after, _) = slot.stuck_for();
         assert!(silent_after < 5, "progress resets the silence");
+    }
+
+    #[test]
+    fn a_taken_drive_says_it_is_busy() {
+        let slot = DriveSlot::new();
+        assert!(!slot.is_busy());
+        assert!(slot.try_start(1));
+        assert!(slot.is_busy());
+        slot.release();
+        assert!(!slot.is_busy());
+    }
+
+    /// A replaced worker starts with a new generation and clean counters: the
+    /// reader uses the generation to retire the old worker's buffers, and the
+    /// miner uses the counters to decide whether this one is alive.
+    #[test]
+    fn a_rebuilt_worker_starts_a_new_generation() {
+        let workers = GpuWorkers::new(vec![crossbeam_channel::unbounded().0]);
+        assert_eq!(workers.generation(), 0);
+        workers.install(vec![crossbeam_channel::unbounded().0]);
+        assert_eq!(workers.generation(), 1);
+        assert_eq!(workers.count(), 1);
+        workers.note_window(false);
+        assert_eq!(workers.failures_in_a_row(), 1);
+        workers.install(vec![crossbeam_channel::unbounded().0]);
+        assert_eq!(workers.generation(), 2);
+        assert_eq!(
+            workers.failures_in_a_row(),
+            0,
+            "a new device starts with no failures"
+        );
     }
 }

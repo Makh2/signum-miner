@@ -1,7 +1,7 @@
 use crate::miner::{Buffer, NonceData};
 use crate::ocl::GpuContext;
-use crate::ocl::{gpu_hash, gpu_transfer};
-use crate::reader::{BufferInfo, ReadReply};
+use crate::ocl::{gpu_hash, gpu_transfer, GpuError};
+use crate::reader::{BufferInfo, GpuWorkers, ReadReply};
 use crossbeam_channel::{Receiver, Sender};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
@@ -11,9 +11,9 @@ use tokio::sync::mpsc::Sender as TokioSender;
 /// How many hashing failures in a row before this worker stops hashing.
 const MAX_FAILURES: u32 = 5;
 
-/// How many times one window is hashed before it is considered lost. The
-/// failures here are OpenCL calls that panicked, so a second try is cheap and
-/// often enough; more than that and the device itself is in trouble.
+/// How many times one window is hashed before it is considered lost. A failed
+/// driver call is reported by `ocl.rs` now, so a second try only costs the
+/// window's transfer; more than that and the device itself is in trouble.
 const MAX_WINDOW_ATTEMPTS: u32 = 2;
 
 /// A worker that has given up says so once, and then this often, so a farm
@@ -34,17 +34,29 @@ fn report_drive_finished(tx_nonce_data: &TokioSender<NonceData>, info: &BufferIn
     });
 }
 
+/// Hands a buffer back to the pool without blocking. See `reader::return_buffer`:
+/// after a rebuild there can be more buffers than the pool was made for.
+fn return_buffer(tx_empty_buffers: &Sender<Box<dyn Buffer + Send>>, buffer: Box<dyn Buffer + Send>) {
+    match tx_empty_buffers.try_send(buffer) {
+        Ok(()) => (),
+        Err(crossbeam_channel::TrySendError::Full(_)) => (),
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => (),
+    }
+}
+
 pub fn create_gpu_worker_task(
     benchmark: bool,
     rx_read_replies: Receiver<ReadReply>,
     tx_empty_buffers: Sender<Box<dyn Buffer + Send>>,
     tx_nonce_data: TokioSender<NonceData>,
     context_mu: Arc<GpuContext>,
+    gpu_workers: Arc<GpuWorkers>,
 ) -> impl FnOnce() + Send + 'static {
     move || {
-        // Failures in a row. A worker whose OpenCL calls keep failing cannot
+        // Failures in a row. A worker whose driver calls keep failing cannot
         // hash anything any more, but it can still hand the buffers back, and
-        // that alone is what keeps the rounds closing.
+        // that alone is what keeps the rounds closing - and `gpu_workers` is
+        // what tells the miner to build a new one.
         let mut failures = 0u32;
         let mut gave_up = false;
         let mut dropped = 0u64;
@@ -58,7 +70,7 @@ pub fn create_gpu_worker_task(
                 if info.finished {
                     report_drive_finished(&tx_nonce_data, &info);
                 }
-                let _ = tx_empty_buffers.send(buffer);
+                return_buffer(&tx_empty_buffers, buffer);
                 continue;
             }
 
@@ -72,50 +84,87 @@ pub fn create_gpu_worker_task(
                 if dropped % GIVE_UP_REPORT_EVERY == 0 {
                     warn!(
                         "GPU worker: still not hashing ({} windows dropped since it gave up; \
-                         restart the miner to bring it back)",
+                         waiting for it to be rebuilt)",
                         dropped
                     );
                 }
                 if info.finished {
                     report_drive_finished(&tx_nonce_data, &info);
                 }
-                let _ = tx_empty_buffers.send(buffer);
+                return_buffer(&tx_empty_buffers, buffer);
                 continue;
             }
 
-            // An OpenCL call that fails panics - ocl.rs unwraps its results - so
-            // the window is hashed under catch_unwind. One failure used to cost
-            // the whole window, and a panicking worker used to take the round
-            // down with it. Now the window gets a second try - a transient
-            // failure then costs nothing - and only a window that keeps failing
-            // is dropped, with the buffer handed back either way.
+            // `ocl.rs` reports a failed driver call as a value now, so a failing
+            // window is not a panic any more. The window still gets a second
+            // try - a transient failure costs nothing that way - and only a
+            // window that keeps failing is dropped, with the buffer handed back
+            // either way. `catch_unwind` stays as a backstop: a panic in a
+            // spawned thread is one thing, but rayon taught this fork what an
+            // unexpected one can do.
             let mut hashed = None;
+            let mut last_error: Option<String> = None;
             for attempt in 1..=MAX_WINDOW_ATTEMPTS {
                 let tried = panic::catch_unwind(AssertUnwindSafe(|| {
-                    gpu_transfer(
-                        &context_mu,
-                        buffer.get_gpu_buffers().unwrap(),
-                        *info.gensig,
-                    );
-                    gpu_hash(
-                        &context_mu,
-                        info.len / 64,
-                        buffer.get_gpu_data().as_ref().unwrap(),
-                    )
+                    let window = || -> Result<(u64, u64), GpuError> {
+                        let gpu_buffer = match buffer.get_gpu_buffers() {
+                            Some(gpu_buffer) => gpu_buffer,
+                            None => {
+                                return Err(GpuError {
+                                    call: "buffer",
+                                    detail: "not a GPU buffer".to_string(),
+                                })
+                            }
+                        };
+                        let data_gpu = match buffer.get_gpu_data() {
+                            Some(data_gpu) => data_gpu,
+                            None => {
+                                return Err(GpuError {
+                                    call: "buffer",
+                                    detail: "no device memory".to_string(),
+                                })
+                            }
+                        };
+                        gpu_transfer(&context_mu, gpu_buffer, *info.gensig)?;
+                        gpu_hash(&context_mu, info.len / 64, &data_gpu)
+                    };
+                    window()
                 }));
                 match tried {
-                    Ok(result) => {
+                    Ok(Ok(result)) => {
                         hashed = Some(result);
                         break;
                     }
+                    Ok(Err(err)) if attempt < MAX_WINDOW_ATTEMPTS => {
+                        warn!(
+                            "GPU worker: hashing failed at height={}, window starting at nonce={} \
+                             ({}) -> trying it again (attempt {} of {})",
+                            info.height,
+                            info.start_nonce,
+                            err,
+                            attempt,
+                            MAX_WINDOW_ATTEMPTS
+                        );
+                    }
+                    Ok(Err(err)) => {
+                        last_error = Some(err.to_string());
+                        break;
+                    }
                     Err(_) if attempt < MAX_WINDOW_ATTEMPTS => warn!(
-                        "GPU worker: hashing failed at height={}, window starting at nonce={} \
+                        "GPU worker: hashing panicked at height={}, window starting at nonce={} \
                          -> trying it again (attempt {} of {})",
                         info.height, info.start_nonce, attempt, MAX_WINDOW_ATTEMPTS
                     ),
-                    Err(_) => break,
+                    Err(_) => {
+                        last_error = Some("panicked".to_string());
+                        break;
+                    }
                 }
             }
+
+            // Every window the worker looked at is a sign of life, whether it
+            // hashed or failed; only silence is not, and the miner watches that.
+            gpu_workers.note_window(hashed.is_some());
 
             match hashed {
                 Some((deadline, offset)) => {
@@ -134,16 +183,19 @@ pub fn create_gpu_worker_task(
                     failures += 1;
                     dropped += 1;
                     error!(
-                        "GPU worker: window at height={}, nonce={} failed {} times in a row \
+                        "GPU worker: window at height={}, nonce={} failed {} times in a row ({}) \
                          -> dropping it ({} window(s) dropped so far)",
-                        info.height, info.start_nonce, MAX_WINDOW_ATTEMPTS, dropped
+                        info.height,
+                        info.start_nonce,
+                        MAX_WINDOW_ATTEMPTS,
+                        last_error.unwrap_or_else(|| "unknown error".to_string()),
+                        dropped
                     );
                     if failures >= MAX_FAILURES {
                         gave_up = true;
                         error!(
                             "GPU worker: giving up hashing after {} failures in a row; buffers will \
-                             still be returned and rounds will still close, but no shares come \
-                             from this worker any more",
+                             still be returned, and the miner will rebuild this worker",
                             failures
                         );
                     } else if info.finished {
@@ -152,11 +204,10 @@ pub fn create_gpu_worker_task(
                 }
             }
 
-            let _ = tx_empty_buffers.send(buffer);
+            return_buffer(&tx_empty_buffers, buffer);
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -212,7 +263,8 @@ mod tests {
             .unwrap();
         }
 
-        let result = gpu_hash(&context, len as usize, &buffer_gpu);
+        let result = gpu_hash(&context, len as usize, &buffer_gpu)
+            .expect("the window hashes");
         assert_eq!(18043101931632730606u64, result.0);
     }
 }

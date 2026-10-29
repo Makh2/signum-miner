@@ -185,6 +185,12 @@ pub struct GpuBuffer {
     context: Arc<GpuContext>,
     data_gpu: core::Mem,
     id: usize,
+    /// Which GPU worker generation this buffer was made for. A buffer belongs to
+    /// the context it was allocated in, and the context is replaced when a
+    /// worker has to be rebuilt; a chunk filled into the old buffer would be
+    /// written with the new worker's queue, which the driver refuses. Such a
+    /// buffer is retired instead, so it cannot poison every window from then on.
+    generation: u64,
 }
 
 impl GpuContext {
@@ -276,7 +282,7 @@ impl GpuBuffer {
         (SCOOP_SIZE as usize) * self.context.gdim1[0]
     }
 
-    pub fn new(context: &Arc<GpuContext>, id: usize) -> Self {
+    pub fn new(context: &Arc<GpuContext>, id: usize, generation: u64) -> Self {
         // create buffers
         // mapping = zero copy buffers, no mapping = pinned memory for fast DMA.
         let size = (SCOOP_SIZE as usize) * context.gdim1[0];
@@ -325,6 +331,7 @@ impl GpuBuffer {
                 context: context.clone(),
                 data_gpu,
                 id,
+                generation,
             }
         } else {
             let buffer_host = unsafe {
@@ -384,6 +391,7 @@ impl GpuBuffer {
                 context: context.clone(),
                 data_gpu,
                 id,
+                generation,
             }
         }
     }
@@ -426,6 +434,9 @@ impl Buffer for GpuBuffer {
     fn get_gpu_data(&self) -> Option<core::Mem> {
         Some(self.data_gpu.clone())
     }
+    fn generation(&self) -> u64 {
+        self.generation
+    }
     fn unmap(&mut self) {
         if !self.context.mapping {
             return;
@@ -456,27 +467,71 @@ impl Buffer for GpuBuffer {
 unsafe impl Sync for GpuContext {}
 unsafe impl Send for GpuBuffer {}
 
-pub fn gpu_transfer(gpu_context: &Arc<GpuContext>, buffer: &GpuBuffer, gensig: [u8; 32]) {
-    upload_gensig(&gpu_context, gensig, true);
-    transfer_buffer_to_gpu(&gpu_context, buffer, true);
+/// A driver call in the hashing path that failed.
+///
+/// Every one of these used to be an `unwrap()`, so every one of them was a panic
+/// - and a panic here does not cost a call, it aborts the whole miner (rayon
+/// aborts the process on a panicking spawned task; under `panic = 'abort'` the
+/// profile did it directly). A window is now a value that either hashed or did
+/// not, and the caller decides what a failure is worth.
+#[derive(Debug, Clone)]
+pub struct GpuError {
+    pub call: &'static str,
+    pub detail: String,
 }
 
-fn upload_gensig(gpu_context: &Arc<GpuContext>, gensig: [u8; 32], blocking: bool) {
-    unsafe {
-        core::enqueue_write_buffer(
-            &gpu_context.queue_compute,
-            &gpu_context.gensig_gpu,
-            blocking,
-            0,
-            &gensig,
-            None::<Event>,
-            None::<&mut Event>,
-        )
-        .unwrap();
+impl std::fmt::Display for GpuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed: {}", self.call, self.detail)
     }
 }
 
-fn transfer_buffer_to_gpu(gpu_context: &Arc<GpuContext>, buffer: &GpuBuffer, blocking: bool) {
+fn driver<T, E: std::fmt::Debug>(
+    call: &'static str,
+    result: Result<T, E>,
+) -> Result<T, GpuError> {
+    result.map_err(|e| GpuError {
+        call,
+        detail: format!("{:?}", e),
+    })
+}
+
+pub fn gpu_transfer(
+    gpu_context: &Arc<GpuContext>,
+    buffer: &GpuBuffer,
+    gensig: [u8; 32],
+) -> Result<(), GpuError> {
+    upload_gensig(&gpu_context, gensig, true)?;
+    transfer_buffer_to_gpu(&gpu_context, buffer, true)
+}
+
+fn upload_gensig(
+    gpu_context: &Arc<GpuContext>,
+    gensig: [u8; 32],
+    blocking: bool,
+) -> Result<(), GpuError> {
+    unsafe {
+        driver(
+            "enqueue_write_buffer(gensig)",
+            core::enqueue_write_buffer(
+                &gpu_context.queue_compute,
+                &gpu_context.gensig_gpu,
+                blocking,
+                0,
+                &gensig,
+                None::<Event>,
+                None::<&mut Event>,
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn transfer_buffer_to_gpu(
+    gpu_context: &Arc<GpuContext>,
+    buffer: &GpuBuffer,
+    blocking: bool,
+) -> Result<(), GpuError> {
     let data = buffer.data.clone();
     let data2 = lock(&*data);
     if gpu_context.mapping {
@@ -484,29 +539,34 @@ fn transfer_buffer_to_gpu(gpu_context: &Arc<GpuContext>, buffer: &GpuBuffer, blo
         // publishes its contents to the device. If the reader already released
         // it (interrupt/read error), there is nothing left to flush.
         if let Some(mapping) = buffer.buffer_ptr_host.as_ref() {
-            core::enqueue_unmap_mem_object(
-                &gpu_context.queue_transfer,
-                &buffer.data_gpu,
-                &*mapping,
-                None::<Event>,
-                None::<&mut Event>,
-            )
-            .unwrap();
+            driver(
+                "enqueue_unmap_mem_object",
+                core::enqueue_unmap_mem_object(
+                    &gpu_context.queue_transfer,
+                    &buffer.data_gpu,
+                    &*mapping,
+                    None::<Event>,
+                    None::<&mut Event>,
+                ),
+            )?;
         }
     } else {
         unsafe {
-            core::enqueue_write_buffer(
-                &gpu_context.queue_transfer,
-                &buffer.data_gpu,
-                blocking,
-                0,
-                &data2,
-                None::<Event>,
-                None::<&mut Event>,
-            )
-            .unwrap();
+            driver(
+                "enqueue_write_buffer(chunk)",
+                core::enqueue_write_buffer(
+                    &gpu_context.queue_transfer,
+                    &buffer.data_gpu,
+                    blocking,
+                    0,
+                    &data2,
+                    None::<Event>,
+                    None::<&mut Event>,
+                ),
+            )?;
         }
     }
+    Ok(())
 }
 
 pub fn gpu_transfer_and_hash(
@@ -514,127 +574,156 @@ pub fn gpu_transfer_and_hash(
     buffer: &GpuBuffer,
     nonce_count: usize,
     data_gpu: &core::Mem,
-) -> (u64, u64) {
-    transfer_buffer_to_gpu(&gpu_context, buffer, false);
-    let result = gpu_hash(&gpu_context, nonce_count, data_gpu);
-    core::finish(&gpu_context.queue_transfer).unwrap();
-    result
+) -> Result<(u64, u64), GpuError> {
+    transfer_buffer_to_gpu(&gpu_context, buffer, false)?;
+    let result = gpu_hash(&gpu_context, nonce_count, data_gpu)?;
+    driver(
+        "finish(transfer)",
+        core::finish(&gpu_context.queue_transfer),
+    )?;
+    Ok(result)
 }
 
 pub fn gpu_hash(
     gpu_context: &Arc<GpuContext>,
     nonce_count: usize,
     data_gpu: &core::Mem,
-) -> (u64, u64) {
-    hash(&gpu_context, nonce_count, data_gpu);
+) -> Result<(u64, u64), GpuError> {
+    hash(&gpu_context, nonce_count, data_gpu)?;
     get_result(&gpu_context)
 }
 
-fn hash(gpu_context: &Arc<GpuContext>, nonce_count: usize, data_gpu: &core::Mem) {
-    core::set_kernel_arg(
-        &gpu_context.kernel1,
-        0,
-        ArgVal::mem(&gpu_context.gensig_gpu),
-    )
-    .unwrap();
-    core::set_kernel_arg(&gpu_context.kernel1, 1, ArgVal::mem(&data_gpu)).unwrap();
-    core::set_kernel_arg(
-        &gpu_context.kernel1,
-        2,
-        ArgVal::mem(&gpu_context.deadlines_gpu),
-    )
-    .unwrap();
+fn hash(
+    gpu_context: &Arc<GpuContext>,
+    nonce_count: usize,
+    data_gpu: &core::Mem,
+) -> Result<(), GpuError> {
+    driver(
+        "set_kernel_arg(kernel1, 0)",
+        core::set_kernel_arg(&gpu_context.kernel1, 0, ArgVal::mem(&gpu_context.gensig_gpu)),
+    )?;
+    driver(
+        "set_kernel_arg(kernel1, 1)",
+        core::set_kernel_arg(&gpu_context.kernel1, 1, ArgVal::mem(&data_gpu)),
+    )?;
+    driver(
+        "set_kernel_arg(kernel1, 2)",
+        core::set_kernel_arg(
+            &gpu_context.kernel1,
+            2,
+            ArgVal::mem(&gpu_context.deadlines_gpu),
+        ),
+    )?;
 
     unsafe {
-        core::enqueue_kernel(
-            &gpu_context.queue_compute,
-            &gpu_context.kernel1,
-            1,
-            None,
-            &gpu_context.gdim1,
-            Some(gpu_context.ldim1),
-            None::<Event>,
-            None::<&mut Event>,
-        )
-        .unwrap();
+        driver(
+            "enqueue_kernel(calculate_deadlines)",
+            core::enqueue_kernel(
+                &gpu_context.queue_compute,
+                &gpu_context.kernel1,
+                1,
+                None,
+                &gpu_context.gdim1,
+                Some(gpu_context.ldim1),
+                None::<Event>,
+                None::<&mut Event>,
+            ),
+        )?;
     }
 
-    core::set_kernel_arg(
-        &gpu_context.kernel2,
-        0,
-        ArgVal::mem(&gpu_context.deadlines_gpu),
-    )
-    .unwrap();
-    core::set_kernel_arg(
-        &gpu_context.kernel2,
-        1,
-        ArgVal::primitive(&(nonce_count as u64)),
-    )
-    .unwrap();
-    core::set_kernel_arg(
-        &gpu_context.kernel2,
-        2,
-        ArgVal::local::<u32>(&gpu_context.ldim2[0]),
-    )
-    .unwrap();
-    core::set_kernel_arg(
-        &gpu_context.kernel2,
-        3,
-        ArgVal::mem(&gpu_context.best_offset_gpu),
-    )
-    .unwrap();
-    core::set_kernel_arg(
-        &gpu_context.kernel2,
-        4,
-        ArgVal::mem(&gpu_context.best_deadline_gpu),
-    )
-    .unwrap();
-
-    unsafe {
-        core::enqueue_kernel(
-            &gpu_context.queue_compute,
+    driver(
+        "set_kernel_arg(kernel2, 0)",
+        core::set_kernel_arg(
+            &gpu_context.kernel2,
+            0,
+            ArgVal::mem(&gpu_context.deadlines_gpu),
+        ),
+    )?;
+    driver(
+        "set_kernel_arg(kernel2, 1)",
+        core::set_kernel_arg(
             &gpu_context.kernel2,
             1,
-            None,
-            &gpu_context.gdim2,
-            Some(gpu_context.ldim2),
-            None::<Event>,
-            None::<&mut Event>,
-        )
-        .unwrap();
+            ArgVal::primitive(&(nonce_count as u64)),
+        ),
+    )?;
+    driver(
+        "set_kernel_arg(kernel2, 2)",
+        core::set_kernel_arg(
+            &gpu_context.kernel2,
+            2,
+            ArgVal::local::<u32>(&gpu_context.ldim2[0]),
+        ),
+    )?;
+    driver(
+        "set_kernel_arg(kernel2, 3)",
+        core::set_kernel_arg(
+            &gpu_context.kernel2,
+            3,
+            ArgVal::mem(&gpu_context.best_offset_gpu),
+        ),
+    )?;
+    driver(
+        "set_kernel_arg(kernel2, 4)",
+        core::set_kernel_arg(
+            &gpu_context.kernel2,
+            4,
+            ArgVal::mem(&gpu_context.best_deadline_gpu),
+        ),
+    )?;
+
+    unsafe {
+        driver(
+            "enqueue_kernel(find_min)",
+            core::enqueue_kernel(
+                &gpu_context.queue_compute,
+                &gpu_context.kernel2,
+                1,
+                None,
+                &gpu_context.gdim2,
+                Some(gpu_context.ldim2),
+                None::<Event>,
+                None::<&mut Event>,
+            ),
+        )?;
     }
+    Ok(())
 }
 
-pub fn get_result(gpu_context: &Arc<GpuContext>) -> (u64, u64) {
+pub fn get_result(gpu_context: &Arc<GpuContext>) -> Result<(u64, u64), GpuError> {
     let mut best_offset = vec![0u64; 1];
     let mut best_deadline = vec![0u64; 1];
 
     unsafe {
-        core::enqueue_read_buffer(
-            &gpu_context.queue_compute,
-            &gpu_context.best_offset_gpu,
-            true,
-            0,
-            &mut best_offset,
-            None::<Event>,
-            None::<&mut Event>,
-        )
-        .unwrap();
+        driver(
+            "enqueue_read_buffer(best_offset)",
+            core::enqueue_read_buffer(
+                &gpu_context.queue_compute,
+                &gpu_context.best_offset_gpu,
+                true,
+                0,
+                &mut best_offset,
+                None::<Event>,
+                None::<&mut Event>,
+            ),
+        )?;
     }
     unsafe {
-        core::enqueue_read_buffer(
-            &gpu_context.queue_compute,
-            &gpu_context.best_deadline_gpu,
-            true,
-            0,
-            &mut best_deadline,
-            None::<Event>,
-            None::<&mut Event>,
-        )
-        .unwrap();
+        driver(
+            "enqueue_read_buffer(best_deadline)",
+            core::enqueue_read_buffer(
+                &gpu_context.queue_compute,
+                &gpu_context.best_deadline_gpu,
+                true,
+                0,
+                &mut best_deadline,
+                None::<Event>,
+                None::<&mut Event>,
+            ),
+        )?;
     }
 
-    (best_deadline[0], best_offset[0])
+    Ok((best_deadline[0], best_offset[0]))
 }
 
 fn get_kernel_work_group_size(x: &core::Kernel, y: core::DeviceId) -> usize {
