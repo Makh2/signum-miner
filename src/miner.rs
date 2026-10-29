@@ -77,6 +77,10 @@ pub struct State {
     /// closes used to be silent: no submissions, no lines, nothing to see.
     round_sw: Stopwatch,
     stalled_warned: bool,
+    /// The last generation signature refused for not being 32 bytes of hex, so
+    /// a pool that keeps sending the same bad one is reported once, not every
+    /// tick.
+    bad_gensig: String,
 }
 
 impl State {
@@ -97,10 +101,31 @@ impl State {
             outage: false,
             round_sw: Stopwatch::new(),
             stalled_warned: false,
+            bad_gensig: "".to_owned(),
         }
     }
 
-    fn update_mining_info(&mut self, mining_info: &MiningInfo) {
+    fn update_mining_info(&mut self, mining_info: &MiningInfo) -> bool {
+        // The signature is a string from the pool, so it can be anything; it
+        // used to be decoded with `unwrap()`. Decode it first, before touching
+        // the round state, so a refusal leaves the miner where it was.
+        let Some(generation_signature_bytes) =
+            poc_hashing::decode_gensig(&mining_info.generation_signature)
+        else {
+            if self.bad_gensig != mining_info.generation_signature {
+                error!(
+                    "{: <80}",
+                    format!(
+                        "pool sent a generationSignature that is not 32 bytes of hex: {:?} \
+                         -> ignoring this block",
+                        mining_info.generation_signature
+                    )
+                );
+                self.bad_gensig = mining_info.generation_signature.clone();
+            }
+            return false;
+        };
+
         for best_deadlines in self.account_id_to_best_deadline.values_mut() {
             *best_deadlines = u64::MAX;
         }
@@ -111,8 +136,7 @@ impl State {
         self.base_target = mining_info.base_target;
         self.server_target_deadline = mining_info.target_deadline;
 
-        self.generation_signature_bytes =
-            poc_hashing::decode_gensig(&mining_info.generation_signature);
+        self.generation_signature_bytes = generation_signature_bytes;
         self.generation_signature = mining_info.generation_signature.clone();
 
         let scoop =
@@ -126,6 +150,7 @@ impl State {
         self.sw.restart();
         self.processed_reader_tasks = 0;
         self.scanning = true;
+        true
     }
 }
 
@@ -639,14 +664,18 @@ impl Miner {
                                         state.outage = false;
                                     }
                                     if mining_info.generation_signature != state.generation_signature {
-                                        state.update_mining_info(&mining_info);
-                                        lock(&reader).start_reading(
-                                            mining_info.height,
-                                            state.block,
-                                            mining_info.base_target,
-                                            state.scoop,
-                                            &Arc::new(state.generation_signature_bytes),
-                                        );
+                                        // A refused signature must not start a
+                                        // round: there would be nothing to scan
+                                        // for.
+                                        if state.update_mining_info(&mining_info) {
+                                            lock(&reader).start_reading(
+                                                mining_info.height,
+                                                state.block,
+                                                mining_info.base_target,
+                                                state.scoop,
+                                                &Arc::new(state.generation_signature_bytes),
+                                            );
+                                        }
                                         drop(state);
                                     } else if state.height > 0
                                         && state.processed_reader_tasks < reader_task_count

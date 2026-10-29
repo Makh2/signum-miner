@@ -90,7 +90,17 @@ Resilience - all of it from watching the miner go silent for hours:
   mining info is wrapped in `catch_unwind` as well. Those are the only places
   where a single failure used to end the whole job: the HTTP path parses headers
   and answers, and the round setup touches the reader tasks and the thread pool.
-  Now such a panic costs one round instead of every round from then on.
+  Now such a panic costs one round instead of every round from then on;
+* the generation signature the pool sends is decoded as a value, not unwrapped.
+  It is a string from outside, so it can be the wrong length or not hex at all,
+  and it used to be a panic in the round setup - with `panic = 'abort'`, the end
+  of the miner. A block with a refused signature is ignored, once per distinct
+  value.
+
+None of this is specific to the GPU build: the buffer timeout, the worker-gone
+lines, the watchdog and `catch_panic` are in the CPU-only build too, and it was
+checked there. Only the GPU worker's own lines are absent from it, because the
+OpenCL code is.
 
 Deliberately **not** here:
 
@@ -106,6 +116,7 @@ Deliberately **not** here:
 | `accepted: height=…, deadline=…` | the pool took the share |
 | `refused: height=…, deadline=…: <pool text>` | the pool's answer; costs nothing |
 | `miner: … panicked -> carrying on` | a panic was caught in a long-lived task; nothing else changed |
+| `pool sent a generationSignature that is not 32 bytes of hex: "…"` | that block is ignored; the pool's string is not to be trusted |
 | `reader …: no free buffer for 60s while scanning height=…` | the hashing side stopped returning buffers |
 | `reader …: GPU worker N is gone` | that worker thread died; buffers are still returned |
 | `GPU worker: hashing failed at height=… -> trying it again (attempt 1 of 2)` | an OpenCL call panicked once; the window gets a second try |
