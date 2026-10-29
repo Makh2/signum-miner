@@ -63,7 +63,14 @@ Build and stability:
   instead of a raw JSON dump:
   `refused: height=1599153, deadline=00:06:10: Deadline exceeds maximum allowed deadline`
   (the old line was red, wrapped over three, and repeated the account on every
-  round).
+  round);
+* the release profile **unwinds** on panic instead of aborting. `panic = 'abort'`
+  is upstream's setting (from `b813a5b`, "Optimize build for size") and it means
+  one failed OpenCL call ends the whole miner - every round in flight with it.
+  It also deletes the recovery code silently: under that strategy
+  `catch_unwind` can never return `Err`, so the compiler folds the `Err` arms
+  away as unreachable. That is what happened here - the built binary did not
+  contain a single string those arms log, which is how it was found.
 
 Resilience - all of it from watching the miner go silent for hours:
 
@@ -77,7 +84,13 @@ Resilience - all of it from watching the miner go silent for hours:
   worker, and a dead worker no longer stops rounds from closing;
 * a round that is still open after 90 seconds is closed by the watchdog with a
   line saying how many reader tasks reported - the round submits what it found
-  instead of the miner going quiet.
+  instead of the miner going quiet;
+* the two tasks the miner cannot lose - the one that starts rounds and the one
+  that submits shares - run their work behind `catch_panic`, and fetching the
+  mining info is wrapped in `catch_unwind` as well. Those are the only places
+  where a single failure used to end the whole job: the HTTP path parses headers
+  and answers, and the round setup touches the reader tasks and the thread pool.
+  Now such a panic costs one round instead of every round from then on.
 
 Deliberately **not** here:
 
@@ -92,10 +105,13 @@ Deliberately **not** here:
 | `round finished: roundtime=…ms, speed=…` | the scan completed and the best share (if any) was submitted |
 | `accepted: height=…, deadline=…` | the pool took the share |
 | `refused: height=…, deadline=…: <pool text>` | the pool's answer; costs nothing |
+| `miner: … panicked -> carrying on` | a panic was caught in a long-lived task; nothing else changed |
 | `reader …: no free buffer for 60s while scanning height=…` | the hashing side stopped returning buffers |
 | `reader …: GPU worker N is gone` | that worker thread died; buffers are still returned |
-| `GPU worker: hashing failed at height=… trying it again` | an OpenCL call panicked once |
-| `GPU worker: giving up hashing after 5 failures` | that worker will not hash again until the miner is restarted |
+| `GPU worker: hashing failed at height=… -> trying it again (attempt 1 of 2)` | an OpenCL call panicked once; the window gets a second try |
+| `GPU worker: window at height=… failed 2 times in a row -> dropping it` | that window is lost; the round keeps going |
+| `GPU worker: giving up hashing after 5 failures in a row` | that worker stops hashing but still returns buffers, so rounds still close |
+| `GPU worker: still not hashing (N windows dropped since it gave up …)` | reminder every 50 windows that a worker is out until restart |
 | `round for height=… has not closed for 90s (N of 5 …)` | the watchdog closed a stuck round |
 
 Deadlines in the log are humanized by foxy-miner with
@@ -140,11 +156,12 @@ From foxy-miner 2.7.0's sources (`lib/currentRoundManager.js`, `lib/proxy.js`):
 ## Still open
 
 * The root cause of the OpenCL failures is not fixed, only survived: `ocl.rs`
-  still unwraps every call. The next step, if the log shows failures, is to make
-  a window's failure recoverable - retry with a bound, and rebuild the GPU
-  context when the device itself is in trouble.
-* The remaining `unwrap()`s on locks are no longer fatal (`utils::lock` recovers
-  from a poisoned mutex), but the two startup-only ones in `miner.rs` and
-  `reader.rs` are still plain `unwrap()`.
+  still unwraps every call, and a window's failure is now recoverable (one retry,
+  then the window is dropped) only because the profile unwinds. The next step, if
+  the log shows failures, is to make the OpenCL calls return `Result` instead of
+  panicking, and rebuild the GPU context when the device itself is in trouble.
+* Mutex poisoning, and with it `utils::lock`, only exists because panics unwind -
+  under `panic = 'abort'` there is nothing to recover. The two startup-only
+  `unwrap()`s in `miner.rs` and `reader.rs` are still plain.
 * No test covers the watchdog or the buffer timeout; both are pure enough to
   extract and test if that ever bites.

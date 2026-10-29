@@ -12,10 +12,10 @@ use crate::plot::{Plot, SCOOP_SIZE};
 use crate::poc_hashing;
 use crate::reader::Reader;
 use crate::requests::RequestHandler;
-use crate::utils::{get_device_id, lock, new_thread_pool};
+use crate::utils::{catch_panic, get_device_id, lock, new_thread_pool};
 use crossbeam_channel;
 use filetime::FileTime;
-use futures_util::{stream::StreamExt};
+use futures_util::{stream::StreamExt, FutureExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 #[cfg(feature = "opencl")]
@@ -25,6 +25,7 @@ use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::fs::read_dir;
 use std::ops::{Deref, DerefMut};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::process;
 use std::ptr::NonNull;
@@ -617,84 +618,104 @@ impl Miner {
                     let request_handler = request_handler.clone();
                     let tx_nonce_data = tx_nonce_data.clone();
                     async move {
-                        let mining_info = request_handler.get_mining_info();
-                        match mining_info.await {
-                            Ok(mining_info) => {
-                                let mut state = lock(&state);
-                                state.first = false;
-                                if state.outage {
-                                    error!("{: <80}", "outage resolved.");
-                                    state.outage = false;
-                                }
-                                if mining_info.generation_signature != state.generation_signature {
-                                    state.update_mining_info(&mining_info);
-                                    lock(&reader).start_reading(
-                                        mining_info.height,
-                                        state.block,
-                                        mining_info.base_target,
-                                        state.scoop,
-                                        &Arc::new(state.generation_signature_bytes),
-                                    );
-                                    drop(state);
-                                } else if state.height > 0
-                                    && state.processed_reader_tasks < reader_task_count
-                                    && state.round_sw.elapsed_ms() > ROUND_STALL_MS
-                                {
-                                    // A round that does not close: a drive task is
-                                    // waiting for a buffer that never comes back, or
-                                    // a hashing worker is gone. Close the round so
-                                    // the miner keeps submitting what it found, and
-                                    // say why - silence was the only symptom before.
-                                    if !state.stalled_warned {
-                                        state.stalled_warned = true;
-                                        error!(
-                                            "round for height={} has not closed for {}s ({} of {} \
-                                             reader tasks reported) -> closing it and carrying on",
-                                            state.height,
-                                            state.round_sw.elapsed_ms() / 1000,
-                                            state.processed_reader_tasks,
-                                            reader_task_count
-                                        );
+                        // The pool side can go wrong in more ways than a
+                        // returned error: building the request parses headers,
+                        // and the answer is parsed too. A panic in there must
+                        // not end the only task that starts rounds.
+                        let mining_info = AssertUnwindSafe(request_handler.get_mining_info())
+                            .catch_unwind()
+                            .await;
+                        // Starting a round is this task's one job and no other
+                        // task does it, so the setup runs behind `catch_panic`
+                        // as well: it touches the reader tasks and the thread
+                        // pool, and a panic there has to cost one round, not
+                        // every round from now on.
+                        catch_panic("miner: starting a round", || match mining_info {
+                                Ok(Ok(mining_info)) => {
+                                    let mut state = lock(&state);
+                                    state.first = false;
+                                    if state.outage {
+                                        error!("{: <80}", "outage resolved.");
+                                        state.outage = false;
                                     }
-                                    let (height, block, base_target) =
-                                        (state.height, state.block, state.base_target);
-                                    drop(state);
-                                    let _ = tx_nonce_data.try_send(NonceData {
-                                        height,
-                                        block,
-                                        base_target,
-                                        deadline: u64::MAX,
-                                        nonce: 0,
-                                        reader_task_processed: true,
-                                        account_id: 0,
-                                    });
-                                } else if !state.scanning
-                                    && wakeup_after != 0
-                                    && state.sw.elapsed_ms() > wakeup_after
-                                {
-                                    info!("HDD, wakeup!");
-                                    lock(&reader).wakeup();
-                                    state.sw.restart();
+                                    if mining_info.generation_signature != state.generation_signature {
+                                        state.update_mining_info(&mining_info);
+                                        lock(&reader).start_reading(
+                                            mining_info.height,
+                                            state.block,
+                                            mining_info.base_target,
+                                            state.scoop,
+                                            &Arc::new(state.generation_signature_bytes),
+                                        );
+                                        drop(state);
+                                    } else if state.height > 0
+                                        && state.processed_reader_tasks < reader_task_count
+                                        && state.round_sw.elapsed_ms() > ROUND_STALL_MS
+                                    {
+                                        // A round that does not close: a drive task is
+                                        // waiting for a buffer that never comes back, or
+                                        // a hashing worker is gone. Close the round so
+                                        // the miner keeps submitting what it found, and
+                                        // say why - silence was the only symptom before.
+                                        if !state.stalled_warned {
+                                            state.stalled_warned = true;
+                                            error!(
+                                                "round for height={} has not closed for {}s ({} of {} \
+                                                 reader tasks reported) -> closing it and carrying on",
+                                                state.height,
+                                                state.round_sw.elapsed_ms() / 1000,
+                                                state.processed_reader_tasks,
+                                                reader_task_count
+                                            );
+                                        }
+                                        let (height, block, base_target) =
+                                            (state.height, state.block, state.base_target);
+                                        drop(state);
+                                        let _ = tx_nonce_data.try_send(NonceData {
+                                            height,
+                                            block,
+                                            base_target,
+                                            deadline: u64::MAX,
+                                            nonce: 0,
+                                            reader_task_processed: true,
+                                            account_id: 0,
+                                        });
+                                    } else if !state.scanning
+                                        && wakeup_after != 0
+                                        && state.sw.elapsed_ms() > wakeup_after
+                                    {
+                                        info!("HDD, wakeup!");
+                                        lock(&reader).wakeup();
+                                        state.sw.restart();
+                                    }
                                 }
-                            }
-                            _ => {
-                                let mut state = lock(&state);
-                                if state.first {
+                                Ok(Err(_)) => {
+                                    let mut state = lock(&state);
+                                    if state.first {
+                                        error!(
+                                            "{: <80}",
+                                            "error getting mining info, please check server config"
+                                        );
+                                        state.first = false;
+                                        state.outage = true;
+                                    } else if !state.outage {
+                                        error!(
+                                            "{: <80}",
+                                            "error getting mining info => connection outage..."
+                                        );
+                                        state.outage = true;
+                                    }
+                                }
+                                Err(_) => {
+                                    let mut state = lock(&state);
                                     error!(
                                         "{: <80}",
-                                        "error getting mining info, please check server config"
+                                        "getting mining info panicked -> carrying on"
                                     );
                                     state.first = false;
                                     state.outage = true;
-                                } else if !state.outage {
-                                    error!(
-                                        "{: <80}",
-                                        "error getting mining info => connection outage..."
-                                    );
-                                    state.outage = true;
                                 }
-                            }
-                        }
+                        });
                     }
                 })
                 .await; 
@@ -720,80 +741,85 @@ impl Miner {
         self.executor.clone().spawn(
             ReceiverStream::new(self.rx_nonce_data)
                 .for_each(move |nonce_data| {
-                    let mut state = lock(&state);
+                    // Every share from here on goes through this task, so a
+                    // single bad share - a header that will not parse, an
+                    // answer that will not either - must not be able to end it.
+                    catch_panic("miner: handling a share", || {
+                        let mut state = lock(&state);
 
-                    let deadline = nonce_data.deadline / nonce_data.base_target;
-                    if state.height == nonce_data.height {
-                        let best_deadline = *state
-                            .account_id_to_best_deadline
-                            .get(&nonce_data.account_id)
-                            .unwrap_or(&u64::MAX);
-                        if best_deadline > deadline
-                            && deadline
-                                < min(
-                                    state.server_target_deadline,
-                                    *(account_id_to_target_deadline
-                                        .get(&nonce_data.account_id)
-                                        .unwrap_or(&target_deadline)),
-                                )
-                        {
-                            // The round's best so far. A pool refusing a share
-                            // costs a request and nothing else, so nothing is
-                            // held back on a guess about the pool's limit: the
-                            // answer is the only way to know it.
-                            state
+                        let deadline = nonce_data.deadline / nonce_data.base_target;
+                        if state.height == nonce_data.height {
+                            let best_deadline = *state
                                 .account_id_to_best_deadline
-                                .insert(nonce_data.account_id, deadline);
-
-                            if inner_submit_only_best {
-                                best_nonce_data = nonce_data.clone();
-                            } else {
-                                request_handler.submit_nonce(
-                                    nonce_data.account_id,
-                                    nonce_data.nonce,
-                                    nonce_data.height,
-                                    nonce_data.block,
-                                    nonce_data.deadline,
-                                    deadline,
-                                    state.generation_signature_bytes,
-                                );
-                            }
-                        }
-
-                        if nonce_data.reader_task_processed {
-                            state.processed_reader_tasks += 1;
-                            if state.processed_reader_tasks == reader_task_count {
-                                info!(
-                                    "{: <80}",
-                                    format!(
-                                        "round finished: roundtime={}ms, speed={:.2}MiB/s",
-                                        state.sw.elapsed_ms(),
-                                        total_size as f64 * 1000.0
-                                            / 1024.0
-                                            / 1024.0
-                                            / state.sw.elapsed_ms() as f64
+                                .get(&nonce_data.account_id)
+                                .unwrap_or(&u64::MAX);
+                            if best_deadline > deadline
+                                && deadline
+                                    < min(
+                                        state.server_target_deadline,
+                                        *(account_id_to_target_deadline
+                                            .get(&nonce_data.account_id)
+                                            .unwrap_or(&target_deadline)),
                                     )
-                                );
+                            {
+                                // The round's best so far. A pool refusing a share
+                                // costs a request and nothing else, so nothing is
+                                // held back on a guess about the pool's limit: the
+                                // answer is the only way to know it.
+                                state
+                                    .account_id_to_best_deadline
+                                    .insert(nonce_data.account_id, deadline);
 
-                                // Submit now our best one, if configured that way
-                                if best_nonce_data.height == state.height {
-                                    let deadline = best_nonce_data.deadline / best_nonce_data.base_target;
+                                if inner_submit_only_best {
+                                    best_nonce_data = nonce_data.clone();
+                                } else {
                                     request_handler.submit_nonce(
-                                        best_nonce_data.account_id,
-                                        best_nonce_data.nonce,
-                                        best_nonce_data.height,
-                                        best_nonce_data.block,
-                                        best_nonce_data.deadline,
+                                        nonce_data.account_id,
+                                        nonce_data.nonce,
+                                        nonce_data.height,
+                                        nonce_data.block,
+                                        nonce_data.deadline,
                                         deadline,
                                         state.generation_signature_bytes,
                                     );
                                 }
+                            }
 
-                                state.sw.restart();
-                                state.scanning = false;
+                            if nonce_data.reader_task_processed {
+                                state.processed_reader_tasks += 1;
+                                if state.processed_reader_tasks == reader_task_count {
+                                    info!(
+                                        "{: <80}",
+                                        format!(
+                                            "round finished: roundtime={}ms, speed={:.2}MiB/s",
+                                            state.sw.elapsed_ms(),
+                                            total_size as f64 * 1000.0
+                                                / 1024.0
+                                                / 1024.0
+                                                / state.sw.elapsed_ms() as f64
+                                        )
+                                    );
+
+                                    // Submit now our best one, if configured that way
+                                    if best_nonce_data.height == state.height {
+                                        let deadline = best_nonce_data.deadline / best_nonce_data.base_target;
+                                        request_handler.submit_nonce(
+                                            best_nonce_data.account_id,
+                                            best_nonce_data.nonce,
+                                            best_nonce_data.height,
+                                            best_nonce_data.block,
+                                            best_nonce_data.deadline,
+                                            deadline,
+                                            state.generation_signature_bytes,
+                                        );
+                                    }
+
+                                    state.sw.restart();
+                                    state.scanning = false;
+                                }
                             }
                         }
-                    }
+                    });
                     futures_util::future::ready(())
                 }),
         );
