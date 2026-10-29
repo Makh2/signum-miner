@@ -1036,7 +1036,15 @@ impl Miner {
 
                             if nonce_data.reader_task_processed {
                                 state.processed_reader_tasks += 1;
-                                if state.processed_reader_tasks >= reader_task_count {
+                                // Only a round that is still running may be closed
+                                // here. A drive that reports late - after the
+                                // watchdog has already closed its round - used to
+                                // close it a second time, resubmitting the share
+                                // that had just been submitted and restarting the
+                                // round timer under a running round.
+                                if state.scanning
+                                    && state.processed_reader_tasks >= reader_task_count
+                                {
                                     let elapsed = state.sw.elapsed_ms();
                                     // A round that closed without a single scan
                                     // has no speed worth printing; the line above
