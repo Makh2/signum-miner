@@ -1,9 +1,13 @@
 # Notes on this fork
 
-This branch is a build of `signum-miner` whose **OpenCL path actually works**, plus
+The `main` branch of this fork is a build of `signum-miner` whose **OpenCL path actually works**, plus
 the fixes needed to keep it running for days. It is based on upstream `master`
-(`4a16d45`, 2025-05-29) and is meant to be run through
+(`4a16d45`, 2025-05-29 — upstream release 2.0.0) and is meant to be run through
 [foxy-miner](https://github.com/foxypool/foxy-miner).
+
+This branch is what is tagged as **v2.1.0** and what the release binaries in
+[Releases](https://github.com/Makh2/signum-miner/releases) are built from; the
+`CHANGELOG.md` at the root of this branch records the changes against upstream.
 
 Read upstream's `README.md` for the miner itself; this file records what is
 different here and what was learned by running it.
@@ -31,8 +35,14 @@ cargo build --release --no-default-features --features opencl,simd_avx2
 cargo test  --release --no-default-features --features opencl,simd_avx2
 ```
 
-The tests are 18 with the GPU worker compiled in, 17 without. There is no test
-coverage for the OpenCL paths themselves - they need a device - so changes there
+The tests pass in three configurations:
+
+* `cargo test` (default features, AVX2 CPU),
+* `cargo test --no-default-features`,
+* `cargo test --no-default-features --features opencl,simd_avx2`.
+
+The last one compiles the GPU worker too and passes **24 tests**; the first two pass
+**23** each. There is no test coverage for the OpenCL paths themselves - they need a device - so changes there
 rest on the build and on watching a live run.
 
 Useful foxy-miner settings (`foxy-miner.yaml`), the ones that matter for this
