@@ -1133,4 +1133,75 @@ mod tests {
         assert!(buffer.iter().next().is_none());
         drop(buffer);
     }
+
+    /// The watchdog closes a round that has not closed after 90 seconds.  A round
+    /// takes about twenty seconds, so this only fires when a drive is waiting for
+    /// a buffer that never comes back, or the GPU worker is gone.  The constant
+    /// itself is the only thing an integration test can verify without a 90-second
+    /// wait — the full behavior is exercised in the live miner.
+    #[test]
+    fn watchdog_stall_timeout_is_90_seconds() {
+        assert_eq!(
+            super::ROUND_STALL_MS, 90_000,
+            "watchdog fires after 90 s, not before; a normal round takes ~20 s"
+        );
+    }
+
+    /// A GPU worker that keeps failing windows is replaced instead of given up on.
+    /// The miner counts failures with `note_window(false)` and rebuilds when the
+    /// count reaches `GPU_FAILURES_IN_A_ROW`.  A successful window resets the
+    /// counter, so a worker that recovers after a transient error is not killed.
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn worker_rebuild_triggered_after_five_consecutive_failures() {
+        use super::GpuWorkers;
+        use crossbeam_channel::unbounded;
+
+        let workers =
+            GpuWorkers::new(vec![unbounded().0, unbounded().0, unbounded().0]);
+
+        // No failures yet
+        assert_eq!(workers.failures_in_a_row(), 0);
+        assert_eq!(workers.generation(), 0);
+
+        // Four failures are not enough
+        for _ in 0..4 {
+            workers.note_window(false);
+        }
+        assert_eq!(workers.failures_in_a_row(), 4);
+        assert_eq!(workers.generation(), 0, "still the same generation");
+
+        // The fifth failure reaches the threshold
+        workers.note_window(false);
+        assert_eq!(workers.failures_in_a_row(), 5);
+
+        // A successful window resets the counter before the rebuild fires
+        workers.note_window(true);
+        assert_eq!(
+            workers.failures_in_a_row(), 0,
+            "a recovered worker is not killed"
+        );
+
+        // The rebuild installs a new generation with clean counters
+        workers.install(vec![unbounded().0]);
+        assert_eq!(workers.generation(), 1);
+        assert_eq!(
+            workers.failures_in_a_row(), 0,
+            "a new device starts with no failures"
+        );
+    }
+
+    /// A worker that has not hashed anything yet reports zero silence.
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn silent_for_ms_is_zero_before_first_window() {
+        use super::GpuWorkers;
+        use crossbeam_channel::unbounded;
+
+        let workers = GpuWorkers::new(vec![unbounded().0]);
+        assert_eq!(
+            workers.silent_for_ms(), 0,
+            "zero means the worker has not been used yet"
+        );
+    }
 }

@@ -859,4 +859,17 @@ mod tests {
             "a new device starts with no failures"
         );
     }
+
+    /// When a higher-weight block preempts a round, the interrupted drive tasks
+    /// are given up to 1.5 seconds to leave before the new round marks them as
+    /// stuck and scans without them.  A drive that finishes within the grace
+    /// period is not named or skipped.  The constant is the only thing a unit
+    /// test can verify without a real 1.5-second wait.
+    #[test]
+    fn preemption_grace_period_is_1500_ms() {
+        assert_eq!(
+            super::PREEMPT_GRACE_MS, 1_500,
+            "1.5 s grace lets most interrupted tasks finish; a slower one is then skipped"
+        );
+    }
 }
