@@ -50,11 +50,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install OpenCL ICD loader (GPU Linux builds)
-        if: matrix.os == 'Linux' && matrix.features == 'opencl,simd_avx2'
+        if: matrix.os == 'ubuntu-latest' && matrix.features == 'opencl,simd_avx2'
         run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
 
       - name: Install OpenCL import lib (GPU Windows builds)
-        if: matrix.os == 'Windows' && matrix.features == 'opencl,simd_avx2'
+        if: matrix.os == 'windows-latest' && matrix.features == 'opencl,simd_avx2'
         shell: pwsh
         run: |
           vcpkg install opencl:x64-windows
