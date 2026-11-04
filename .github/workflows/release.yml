@@ -68,12 +68,19 @@ jobs:
       - name: Rename binary
         shell: bash
         run: |
-          cp "target/release/signum-miner" "${{ matrix.name }}"
+          mkdir -p dist
+          if [ -f "target/release/signum-miner.exe" ]; then
+            cp "target/release/signum-miner.exe" "dist/${{ matrix.name }}.exe"
+          else
+            cp "target/release/signum-miner" "dist/${{ matrix.name }}"
+          fi
+          ls -la dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
           retention-days: 7
 
   release:
