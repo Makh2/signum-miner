@@ -59,7 +59,7 @@ jobs:
         run: |
           vcpkg install opencl:x64-windows
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\opencl\lib\x64" | Out-Null
-          Copy-Item "$env:vcpkg\installed\x64-windows\lib\OpenCL.lib" "$env:RUNNER_TEMP\opencl\lib\x64\OpenCL.lib"
+          Copy-Item "C:\vcpkg\installed\x64-windows\lib\OpenCL.lib" "$env:RUNNER_TEMP\opencl\lib\x64\OpenCL.lib"
           Add-Content $env:GITHUB_ENV "CUDA_PATH=$env:RUNNER_TEMP\opencl"
 
       - name: Build
