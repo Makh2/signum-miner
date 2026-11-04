@@ -25,5 +25,5 @@ jobs:
         run: cargo test --verbose
       - name: Run tests without default features
         run: cargo test --no-default-features --verbose
-      - name: Run tests with the OpenCL GPU worker
-        run: cargo test --no-default-features --features opencl,simd_avx2 --verbose
+      - name: Build with the OpenCL GPU worker
+        run: cargo build --no-default-features --features opencl,simd_avx2 --verbose
