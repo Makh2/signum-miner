@@ -96,6 +96,16 @@ Linux: for the OpenCL build install the OpenCL ICD loader
 Windows: for the OpenCL build install the vendor OpenCL SDK / CUDA toolkit so that
 `OpenCL.lib` is available.
 
+## 🏃 Running
+
+The miner reads `config.yaml` from its working directory (see the release for a
+sample) and connects to a Signum pool or a solo mining endpoint. On Windows it is
+usually started through [foxy-miner](https://github.com/foxypool/foxy-miner);
+on Linux run the binary directly.
+
+GPU configuration lives in `config.yaml` (`gpu_threads`, `gpu_platform`,
+`gpu_mem_mapping`, `gpu_workers`) and is enabled with the `opencl` feature build.
+
 ## ✅ Verifying a release
 
 Each release carries `SHA256SUMS` and a source tarball (GPL-3.0). Check the
