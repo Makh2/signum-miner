@@ -570,11 +570,14 @@ impl Reader {
                         Ok(x) => x,
                         Err(e) => {
                             error!(
-                                "reader: error reading chunk from {}: {} -> skip one round",
+                                "reader: error reading chunk from {}: {} -> skipping this plot for the round",
                                 p.meta.name, e
                             );
                             buffer.unmap();
-                            (0, 0, true)
+                            // Behavioral skip: a bad chunk means this plot's tail for
+                            // this round cannot be trusted, so skip to the next plot
+                            // instead of letting the round stall into the watchdog.
+                            continue 'outer;
                         }
                     };
                     slot.progress();
