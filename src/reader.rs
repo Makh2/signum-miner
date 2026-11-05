@@ -1,6 +1,7 @@
 use crate::miner::Buffer;
 #[cfg(feature = "opencl")]
 use crate::miner::CpuBuffer;
+use crate::miner::NonceData;
 use crate::plot::{Meta, Plot};
 use crate::utils::{lock, new_thread_pool};
 use crossbeam_channel;
@@ -8,12 +9,14 @@ use crossbeam_channel::{Receiver, Sender};
 use pbr::{ProgressBar, Units};
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::io;
 use std::io::Stdout;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use stopwatch::Stopwatch;
+use tokio::sync::mpsc;
 
 /// How long a drive task waits for a free buffer before looking around again.
 const BUFFER_WAIT_MS: u64 = 500;
@@ -275,6 +278,13 @@ pub struct Reader {
     drive_slots: Arc<HashMap<String, Arc<DriveSlot>>>,
     show_progress: bool,
     show_drive_stats: bool,
+    /// How long a single chunk read may take before the drive is given up on
+    /// for the round.
+    read_timeout: Duration,
+    /// Lets a drive that gave up on a hung read tell the round it is done, so
+    /// the round closes when the other drives finish instead of waiting for the
+    /// round watchdog.
+    tx_nonce_data: mpsc::Sender<NonceData>,
 }
 
 impl Reader {
@@ -290,6 +300,8 @@ impl Reader {
         show_drive_stats: bool,
         thread_pinning: bool,
         benchmark: bool,
+        read_timeout: Duration,
+        tx_nonce_data: mpsc::Sender<NonceData>,
     ) -> Reader {
         if !benchmark {
             check_overlap(&drive_id_to_plots);
@@ -314,6 +326,8 @@ impl Reader {
             drive_slots,
             show_progress,
             show_drive_stats,
+            read_timeout,
+            tx_nonce_data,
         }
     }
 
@@ -418,6 +432,8 @@ impl Reader {
                     gensig.clone(),
                     self.show_drive_stats,
                     slot,
+                    self.read_timeout,
+                    self.tx_nonce_data.clone(),
                 )
             } else {
                 self.create_read_task(
@@ -431,6 +447,8 @@ impl Reader {
                     gensig.clone(),
                     self.show_drive_stats,
                     slot,
+                    self.read_timeout,
+                    self.tx_nonce_data.clone(),
                 )
             };
 
@@ -476,6 +494,8 @@ impl Reader {
         gensig: Arc<[u8; 32]>,
         show_drive_stats: bool,
         slot: Arc<DriveSlot>,
+        read_timeout: Duration,
+        tx_nonce_data: mpsc::Sender<NonceData>,
     ) -> (Sender<()>, impl FnOnce()) {
         let (tx_interupt, rx_interupt) = crossbeam_channel::unbounded();
         let rx_empty_buffers = self.rx_empty_buffers.clone();
@@ -491,6 +511,12 @@ impl Reader {
         // and the drive is given back so the next round can use it.
         let release_slot = slot.clone();
         let drive_name = drive.clone();
+        // A read that timed out leaves its thread stuck in the driver and its
+        // buffer lost. The drive must not be handed back to the next round - it
+        // would only lose another buffer - so the slot stays taken until the
+        // miner is restarted, exactly like a drive whose task never came back.
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let timed_out_flag = timed_out.clone();
         let body = move || {
             let mut sw = Stopwatch::new();
             let mut elapsed = 0i64;
@@ -565,21 +591,48 @@ impl Reader {
                         sw.restart();
                     }
                     let mut_bs = buffer.get_buffer_for_writing();
-                    let mut bs = lock(&mut_bs);
-                    let (bytes_read, start_nonce, next_plot) = match p.read(&mut bs, scoop) {
-                        Ok(x) => x,
-                        Err(e) => {
-                            error!(
-                                "reader: error reading chunk from {}: {} -> skipping this plot for the round",
-                                p.meta.name, e
-                            );
-                            buffer.unmap();
-                            // Behavioral skip: a bad chunk means this plot's tail for
-                            // this round cannot be trusted, so skip to the next plot
-                            // instead of letting the round stall into the watchdog.
-                            continue 'outer;
-                        }
-                    };
+                    let (bytes_read, start_nonce, next_plot) =
+                        match p.read_timed(mut_bs.clone(), scoop, read_timeout) {
+                            Ok(x) => x,
+                            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                                error!(
+                                    "reader {}: read on {} did not return within {}s -> giving \
+                                     up on this drive for this round",
+                                    drive,
+                                    p.meta.name,
+                                    read_timeout.as_secs()
+                                );
+                                // The read thread is still stuck in the driver and
+                                // holds the buffer; the buffer is lost with it. Keep
+                                // the slot taken so later rounds skip this drive
+                                // instead of losing another buffer on it.
+                                timed_out_flag.store(true, Ordering::SeqCst);
+                                // Tell the round this drive is done, so it closes
+                                // when the other drives finish instead of waiting
+                                // for the round watchdog.
+                                let _ = tx_nonce_data.try_send(NonceData {
+                                    height,
+                                    block,
+                                    base_target,
+                                    deadline: u64::MAX,
+                                    nonce: 0,
+                                    reader_task_processed: true,
+                                    account_id: 0,
+                                });
+                                break 'outer;
+                            }
+                            Err(e) => {
+                                error!(
+                                    "reader: error reading chunk from {}: {} -> skipping this plot for the round",
+                                    p.meta.name, e
+                                );
+                                buffer.unmap();
+                                // Behavioral skip: a bad chunk means this plot's tail for
+                                // this round cannot be trusted, so skip to the next plot
+                                // instead of letting the round stall into the watchdog.
+                                continue 'outer;
+                            }
+                        };
                     slot.progress();
 
                     if rx_interupt.try_recv().is_ok() {
@@ -764,7 +817,12 @@ impl Reader {
 
         (tx_interupt, move || {
             let caught = panic::catch_unwind(AssertUnwindSafe(body));
-            release_slot.release();
+            // A drive whose read timed out keeps its slot: its read thread is
+            // still stuck in the driver, and handing the drive back would only
+            // cost the next round another buffer.
+            if !timed_out.load(Ordering::SeqCst) {
+                release_slot.release();
+            }
             if caught.is_err() {
                 error!(
                     "reader {}: panicked while scanning height={}, scoop={} -> drive gives up \

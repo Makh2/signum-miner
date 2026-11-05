@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "opencl")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 use std::u64;
 use stopwatch::Stopwatch;
 use tokio::runtime::Handle;
@@ -753,6 +754,8 @@ impl Miner {
                 cfg.show_drive_stats,
                 cfg.cpu_thread_pinning,
                 cfg.benchmark_cpu(),
+                Duration::from_millis(cfg.hdd_read_timeout_ms),
+                tx_nonce_data.clone(),
             ),
             #[cfg(feature = "opencl")]
             gpu_farm,
