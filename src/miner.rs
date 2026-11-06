@@ -27,7 +27,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use ocl_core::Mem;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cmp::{max, min};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::read_dir;
 use std::ops::{Deref, DerefMut};
 use std::panic::AssertUnwindSafe;
@@ -756,6 +756,7 @@ impl Miner {
                 cfg.benchmark_cpu(),
                 Duration::from_millis(cfg.hdd_read_timeout_ms),
                 tx_nonce_data.clone(),
+                Arc::new(Mutex::new(HashSet::<String>::new())),
             ),
             #[cfg(feature = "opencl")]
             gpu_farm,

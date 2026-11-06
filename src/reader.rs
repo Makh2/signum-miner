@@ -8,7 +8,7 @@ use crossbeam_channel;
 use crossbeam_channel::{Receiver, Sender};
 use pbr::{ProgressBar, Units};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::Stdout;
 use std::panic::{self, AssertUnwindSafe};
@@ -285,6 +285,9 @@ pub struct Reader {
     /// the round closes when the other drives finish instead of waiting for the
     /// round watchdog.
     tx_nonce_data: mpsc::Sender<NonceData>,
+    /// Plots whose reads hung during a round, so later rounds skip them
+    /// instead of losing a buffer on them again.
+    bad_plots: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Reader {
@@ -302,6 +305,7 @@ impl Reader {
         benchmark: bool,
         read_timeout: Duration,
         tx_nonce_data: mpsc::Sender<NonceData>,
+        bad_plots: Arc<Mutex<HashSet<String>>>,
     ) -> Reader {
         if !benchmark {
             check_overlap(&drive_id_to_plots);
@@ -328,6 +332,7 @@ impl Reader {
             show_drive_stats,
             read_timeout,
             tx_nonce_data,
+            bad_plots,
         }
     }
 
@@ -511,12 +516,7 @@ impl Reader {
         // and the drive is given back so the next round can use it.
         let release_slot = slot.clone();
         let drive_name = drive.clone();
-        // A read that timed out leaves its thread stuck in the driver and its
-        // buffer lost. The drive must not be handed back to the next round - it
-        // would only lose another buffer - so the slot stays taken until the
-        // miner is restarted, exactly like a drive whose task never came back.
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let timed_out_flag = timed_out.clone();
+        let bad_plots = self.bad_plots.clone();
         let body = move || {
             let mut sw = Stopwatch::new();
             let mut elapsed = 0i64;
@@ -525,6 +525,11 @@ impl Reader {
             let plot_count = plots.len();
             'outer: for (i_p, p) in plots.iter().enumerate() {
                 let mut p = lock(p);
+                if bad_plots.lock().unwrap().contains(&p.meta.name) {
+                    // This plot already hung once; drop it and keep the drive
+                    // scanning its remaining plots instead of dropping the drive.
+                    continue 'outer;
+                }
                 if let Err(e) = p.prepare(scoop) {
                     error!(
                         "reader: error preparing {} for reading: {} -> skip one round",
@@ -596,30 +601,18 @@ impl Reader {
                             Ok(x) => x,
                             Err(e) if e.kind() == io::ErrorKind::TimedOut => {
                                 error!(
-                                    "reader {}: read on {} did not return within {}s -> giving \
-                                     up on this drive for this round",
+                                    "reader {}: read on {} did not return within {}s -> \
+                                     skipping its plot for this round",
                                     drive,
                                     p.meta.name,
                                     read_timeout.as_secs()
                                 );
-                                // The read thread is still stuck in the driver and
-                                // holds the buffer; the buffer is lost with it. Keep
-                                // the slot taken so later rounds skip this drive
-                                // instead of losing another buffer on it.
-                                timed_out_flag.store(true, Ordering::SeqCst);
-                                // Tell the round this drive is done, so it closes
-                                // when the other drives finish instead of waiting
-                                // for the round watchdog.
-                                let _ = tx_nonce_data.try_send(NonceData {
-                                    height,
-                                    block,
-                                    base_target,
-                                    deadline: u64::MAX,
-                                    nonce: 0,
-                                    reader_task_processed: true,
-                                    account_id: 0,
-                                });
-                                break 'outer;
+                                // The read thread is stuck in the driver and holds the
+                                // buffer; it is lost with it. Skip this plot - the
+                                // corrupted nonce range is dropped - and keep the drive
+                                // on the rest of its plots.
+                                bad_plots.lock().unwrap().insert(p.meta.name.clone());
+                                continue 'outer;
                             }
                             Err(e) => {
                                 error!(
@@ -817,12 +810,7 @@ impl Reader {
 
         (tx_interupt, move || {
             let caught = panic::catch_unwind(AssertUnwindSafe(body));
-            // A drive whose read timed out keeps its slot: its read thread is
-            // still stuck in the driver, and handing the drive back would only
-            // cost the next round another buffer.
-            if !timed_out.load(Ordering::SeqCst) {
-                release_slot.release();
-            }
+            release_slot.release();
             if caught.is_err() {
                 error!(
                     "reader {}: panicked while scanning height={}, scoop={} -> drive gives up \
