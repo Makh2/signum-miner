@@ -239,6 +239,31 @@ impl Reader {
                                 // corrupted nonce range is dropped - and keep the drive
                                 // scanning its remaining plots.
                                 bad_plots.lock().unwrap().insert(p.meta.name.clone());
+                                // Return the buffer to the pool instead of dropping
+                                // it, so a hung plot cannot drain the reader.
+                                tx_empty_buffers.send(buffer).unwrap();
+                                if i_p == (plot_count - 1) {
+                                    // Last plot on this drive: tell the round it is
+                                    // done so it can close.
+                                    tx_read_replies_cpu
+                                        .send(ReadReply {
+                                            buffer: Box::new(CpuBuffer::new(buffer_cap))
+                                                as Box<dyn Buffer + Send>,
+                                            info: BufferInfo {
+                                                len: 0,
+                                                height,
+                                                block,
+                                                base_target,
+                                                gensig: gensig.clone(),
+                                                start_nonce: 0,
+                                                finished: true,
+                                                account_id: 0,
+                                                gpu_signal: 0,
+                                            },
+                                        })
+                                        .expect("failed to send read data to CPU thread");
+                                    break 'outer;
+                                }
                                 continue 'outer;
                             }
                             Err(e) => {
